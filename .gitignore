@@ -1,3 +1,7 @@
+# Local tooling
+.gsd/
+.bg-shell/
+
 # Terraform (all terraform/ modules and future stacks)
 **/.terraform/
 **/.terraform/**
