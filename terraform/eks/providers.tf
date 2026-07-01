@@ -4,7 +4,7 @@ provider "aws" {
   default_tags {
     tags = merge(
       {
-        Project = "kube-fluff-eks-test"
+        Project = "kube-rbac-polp-eks-test"
       },
       var.tags,
     )

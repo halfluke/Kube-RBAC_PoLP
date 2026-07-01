@@ -1,4 +1,4 @@
-# Kube-fluff
+# Kube-RBAC_PoLP
 
 **Testing disclaimer:** These scripts have been exercised **only in local Kubernetes environments** and, **partially**, on **OpenShift** (an **earlier** version of the repo). They have **not** yet been fully validated on **AKS, EKS, or GKE**; **planned** testing on those platforms is expected **within a reasonable timeframe**. Treat cloud-specific paths and Terraform stacks accordingly.
 
@@ -11,7 +11,7 @@ These tools are intended for **analysis, education, and lab environments**. They
 ## Quickstart
 
 ```bash
-cd /path/to/Kube-fluff
+cd /path/to/Kube-RBAC_PoLP
 chmod +x *.sh   # once, if needed
 ```
 

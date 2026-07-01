@@ -18,7 +18,7 @@ variable "zone" {
 variable "cluster_name" {
   description = "GKE cluster name."
   type        = string
-  default     = "kube-fluff-gke-test"
+  default     = "kube-rbac-polp-gke-test"
 }
 
 variable "machine_type" {
@@ -42,7 +42,7 @@ variable "deploy_capability_test_workloads" {
 variable "capability_test_namespace" {
   description = "Namespace for capability test pods (PSA enforce=privileged so examples schedule on default GKE admission)."
   type        = string
-  default     = "kube-fluff-cap-test"
+  default     = "kube-rbac-polp-cap-test"
 }
 
 variable "capability_test_pause_image" {

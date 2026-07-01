@@ -19,7 +19,7 @@ variable "deploy_capability_test_workloads" {
 variable "capability_test_namespace" {
   description = "Namespace for capability fixtures (PSA enforce=privileged for broad compatibility on local clusters)."
   type        = string
-  default     = "kube-fluff-local-cap-test"
+  default     = "kube-rbac-polp-local-cap-test"
 }
 
 variable "capability_test_pause_image" {
@@ -43,5 +43,5 @@ variable "deploy_rbac_test_fixtures" {
 variable "rbac_test_namespace" {
   description = "Namespace for RBAC fixtures."
   type        = string
-  default     = "kube-fluff-local-rbac-test"
+  default     = "kube-rbac-polp-local-rbac-test"
 }

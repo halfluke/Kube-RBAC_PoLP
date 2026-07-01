@@ -5,9 +5,9 @@
 project_id = "your-gcp-project-id"
 # region     = "us-central1"
 # zone       = "us-central1-a"
-# cluster_name = "kube-fluff-gke-test"
+# cluster_name = "kube-rbac-polp-gke-test"
 # machine_type = "e2-small"
 #
 # deploy_capability_test_workloads = false
-# capability_test_namespace        = "kube-fluff-cap-test"
+# capability_test_namespace        = "kube-rbac-polp-cap-test"
 # capability_test_pause_image      = "registry.k8s.io/pause:3.9"

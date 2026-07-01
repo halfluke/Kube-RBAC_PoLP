@@ -5,10 +5,10 @@
 # Azure: az login (or service principal env vars). azurerm 4.x also accepts ARM_SUBSCRIPTION_ID.
 #
 # location              = "eastus"
-# resource_group_name = "kube-fluff-aks-test-rg"
-# cluster_name          = "kube-fluff-aks-test"
+# resource_group_name = "kube-rbac-polp-aks-test-rg"
+# cluster_name          = "kube-rbac-polp-aks-test"
 # vm_size               = "Standard_B2s"
 #
 # deploy_capability_test_workloads = false
 # deploy_rbac_test_fixtures        = false
-# capability_test_namespace        = "kube-fluff-cap-test"
+# capability_test_namespace        = "kube-rbac-polp-cap-test"

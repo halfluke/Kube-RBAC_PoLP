@@ -7,7 +7,7 @@ variable "aws_region" {
 variable "cluster_name" {
   description = "EKS cluster name."
   type        = string
-  default     = "kube-fluff-eks-test"
+  default     = "kube-rbac-polp-eks-test"
 }
 
 variable "cluster_version" {
@@ -66,19 +66,19 @@ variable "deploy_irsa_demo" {
 variable "capability_test_namespace" {
   description = "Namespace for capability test pods (PSA enforce=privileged so fixtures schedule cleanly)."
   type        = string
-  default     = "kube-fluff-cap-test"
+  default     = "kube-rbac-polp-cap-test"
 }
 
 variable "rbac_test_namespace" {
   description = "Namespace for RBAC test RoleBinding (must not collide with capability_test_namespace)."
   type        = string
-  default     = "kube-fluff-rbac-test"
+  default     = "kube-rbac-polp-rbac-test"
 }
 
 variable "irsa_demo_service_account_name" {
   description = "Kubernetes ServiceAccount name for the IRSA demo workload."
   type        = string
-  default     = "kube-fluff-irsa-demo-sa"
+  default     = "kube-rbac-polp-irsa-demo-sa"
 }
 
 variable "capability_test_pause_image" {

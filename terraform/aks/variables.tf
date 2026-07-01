@@ -7,13 +7,13 @@ variable "location" {
 variable "resource_group_name" {
   description = "Resource group name (created by this module)."
   type        = string
-  default     = "kube-fluff-aks-test-rg"
+  default     = "kube-rbac-polp-aks-test-rg"
 }
 
 variable "cluster_name" {
   description = "AKS cluster name (also used as dns_prefix when dns_prefix is empty)."
   type        = string
-  default     = "kube-fluff-aks-test"
+  default     = "kube-rbac-polp-aks-test"
 }
 
 variable "dns_prefix" {
@@ -61,13 +61,13 @@ variable "deploy_rbac_test_fixtures" {
 variable "capability_test_namespace" {
   description = "Namespace for capability test pods (PSA enforce=privileged)."
   type        = string
-  default     = "kube-fluff-cap-test"
+  default     = "kube-rbac-polp-cap-test"
 }
 
 variable "rbac_test_namespace" {
   description = "Namespace for RBAC test RoleBinding (must not collide with capability_test_namespace)."
   type        = string
-  default     = "kube-fluff-rbac-test"
+  default     = "kube-rbac-polp-rbac-test"
 }
 
 variable "capability_test_pause_image" {

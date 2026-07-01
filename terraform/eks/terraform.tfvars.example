@@ -11,7 +11,7 @@
 # have it — the script reports that case explicitly.
 
 # aws_region   = "us-west-2"
-# cluster_name = "kube-fluff-eks-test"
+# cluster_name = "kube-rbac-polp-eks-test"
 
 # deploy_capability_test_workloads = true
 # deploy_rbac_test_fixtures        = true
