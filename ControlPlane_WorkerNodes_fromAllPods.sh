@@ -10,6 +10,7 @@ OUTPUT_MODE="human"
 NAMESPACE_FILTER_RAW=""
 MAX_PODS=0
 TRUNCATE_LIMIT=120
+CHECK_IMDS_CREDS=0
 # --- End Configuration ---
 
 usage() {
@@ -23,6 +24,9 @@ Options:
   --timeout N               Overall timeout seconds for probe commands (default: 3)
   --connect-timeout N       curl connect-timeout seconds (default: 3)
   --max-pods N              Max number of running pods to test (0 = all, default: 0)
+  --check-imds-creds        Opt-in: from each probed pod, attempt cloud IMDS
+                            credential retrieval (AWS/GCP/Azure). Secrets are
+                            redacted; only masked identity prefixes are printed.
   -h, --help                Show this help
 EOF
 }
@@ -34,6 +38,7 @@ while [[ $# -gt 0 ]]; do
         --timeout) TIMEOUT="${2:-}"; shift 2 ;;
         --connect-timeout) CONNECT_TIMEOUT="${2:-}"; shift 2 ;;
         --max-pods) MAX_PODS="${2:-}"; shift 2 ;;
+        --check-imds-creds) CHECK_IMDS_CREDS=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Error: Unknown option '$1'"; usage; exit 2 ;;
     esac
@@ -133,7 +138,7 @@ truncate_value() {
 emit_finding() {
     local src_namespace="${1:-}" src_name="${2:-}" host_network="${3:-}" service_account="${4:-}" netpol_count="${5:-}" netpol_match="${6:-}" policy_engine="${7:-}" plugin_policy_count="${8:-}" plugin_policy_refs="${9:-}" dest_role="${10:-}" ip="${11:-}" port="${12:-}" status="${13:-}" details="${14:-}"
     local risk="false"
-    if [[ "$status" == "EXPOSED" ]]; then
+    if [[ "$status" == "EXPOSED" || "$status" == "EXPOSED_CREDS" ]]; then
         risk="true"
     fi
 
@@ -161,14 +166,14 @@ emit_finding() {
           --arg risk "$risk" \
           '{src_namespace:$src_namespace,src_pod:$src_pod,hostNetwork:$host_network,serviceAccount:$service_account,netpol_ns_count:$netpol_ns_count,netpol_match:$netpol_match,policy_engine:$policy_engine,plugin_policy_count:$plugin_policy_count,plugin_policy_refs:$plugin_policy_refs,dest_role:$dest_role,dest_ip:$dest_ip,port:$port,status:$status,details:$details,risk:($risk=="true")}'
     else
-        if [[ "$status" == "EXPOSED" ]]; then
+        if [[ "$status" == "EXPOSED" || "$status" == "EXPOSED_CREDS" ]]; then
             echo "=========ALERT========="
         fi
         printf "%s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s | %s\n" \
             "$src_namespace" "$src_name" "$host_network" "$service_account" "$netpol_count" "$(truncate_value "$netpol_match")" \
             "$policy_engine" "$plugin_policy_count" "$(truncate_value "$plugin_policy_refs")" \
             "$dest_role" "$ip" "$port" "$status" "$details"
-        if [[ "$status" == "EXPOSED" ]]; then
+        if [[ "$status" == "EXPOSED" || "$status" == "EXPOSED_CREDS" ]]; then
             echo "=========ALERT========="
         fi
     fi
@@ -196,6 +201,105 @@ test_connection_simple() {
             print_result "$src_namespace" "$src_name" "$host_network" "$service_account" "$netpol_count" "$netpol_match" "$dest_role" "$ip" "$port" "TEST_ERROR" "Probe failed (curl/exec rc=$rc)."
             ;;
     esac
+}
+
+# Opt-in IMDS credential retrieval (secrets redacted). Port 80 on 169.254.169.254.
+# Emits EXPOSED_CREDS / NOT_RETRIEVABLE / TEST_ERROR via emit_finding.
+test_imds_creds() {
+    local src_namespace="${1:-}" src_name="${2:-}" host_network="${3:-}" service_account="${4:-}" netpol_count="${5:-}" netpol_match="${6:-}"
+    local imds_ip="169.254.169.254"
+    local imds_port="80"
+    local dest_role="IMDS"
+
+    # Reachability first (TCP/HTTP to link-local metadata).
+    local reach_cmd="command -v curl >/dev/null 2>&1 || exit 127; timeout $TIMEOUT curl -s -o /dev/null --connect-timeout $CONNECT_TIMEOUT -m $TIMEOUT http://${imds_ip}/"
+    local reach_rc
+    reach_rc=$(run_exec_probe "$src_namespace" "$src_name" "$reach_cmd")
+    case "$(classify_connectivity_code "$reach_rc")" in
+        BLOCKED_OR_UNREACHABLE)
+            print_result "$src_namespace" "$src_name" "$host_network" "$service_account" "$netpol_count" "$netpol_match" "$dest_role" "$imds_ip" "$imds_port" "NOT_RETRIEVABLE" "IMDS endpoint blocked/unreachable (rc=$reach_rc)."
+            return
+            ;;
+        TEST_ERROR)
+            # Continue — some clouds return non-zero on bare / but still serve metadata paths.
+            ;;
+    esac
+
+    # In-pod probe: confirm credential material is obtainable; redact secrets.
+    # Markers: __AWS_OK__ role=... AccessKeyId=ASA****REDACTED
+    #          __GCP_OK__ (token withheld)
+    #          __AZ_OK__ (token withheld)
+    local probe_script
+    probe_script=$(cat <<'EOS'
+URL_AWS_TOKEN="http://169.254.169.254/latest/api/token"
+URL_AWS="http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+URL_GCP="http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token"
+URL_AZ="http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/"
+found=""
+if ! command -v curl >/dev/null 2>&1; then
+  echo "__NO_HTTP_TOOL__"
+  exit 0
+fi
+T=$(curl -s -m 3 -X PUT "$URL_AWS_TOKEN" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+if [ -n "$T" ]; then
+  ROLE=$(curl -s -m 3 -H "X-aws-ec2-metadata-token: $T" "$URL_AWS" 2>/dev/null | head -n1 | tr -d '\r')
+  if [ -n "$ROLE" ]; then
+    CREDS=$(curl -s -m 3 -H "X-aws-ec2-metadata-token: $T" "${URL_AWS}${ROLE}" 2>/dev/null || true)
+    AKID=$(printf '%s' "$CREDS" | sed -n 's/.*"AccessKeyId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+    if [ -n "$AKID" ]; then
+      PREFIX=$(printf '%s' "$AKID" | cut -c1-4)
+      echo "__AWS_OK__ role=${ROLE} AccessKeyId=${PREFIX}****REDACTED"
+      found=1
+    elif printf '%s' "$CREDS" | grep -q AccessKeyId; then
+      echo "__AWS_OK__ role=${ROLE} AccessKeyId=****REDACTED"
+      found=1
+    fi
+  fi
+fi
+GCP=$(curl -s -m 3 -H "Metadata-Flavor: Google" "$URL_GCP" 2>/dev/null || true)
+if printf '%s' "$GCP" | grep -q access_token; then
+  echo "__GCP_OK__ (OAuth token withheld by design)"
+  found=1
+fi
+AZ=$(curl -s -m 3 -H "Metadata:true" "$URL_AZ" 2>/dev/null || true)
+if printf '%s' "$AZ" | grep -Eqi 'access_token|client_id'; then
+  echo "__AZ_OK__ (MSI token withheld by design)"
+  found=1
+fi
+if [ -z "$found" ]; then
+  echo "__NOT_RETRIEVABLE__"
+fi
+EOS
+)
+
+    set +e
+    local out
+    out=$("$KCLI" exec -n "$src_namespace" "$src_name" -- sh -c "$probe_script" 2>/dev/null)
+    local exec_rc=$?
+    set -e
+
+    if [[ "$exec_rc" -ne 0 ]]; then
+        print_result "$src_namespace" "$src_name" "$host_network" "$service_account" "$netpol_count" "$netpol_match" "$dest_role" "$imds_ip" "$imds_port" "TEST_ERROR" "IMDS credential probe exec failed (rc=$exec_rc)."
+        return
+    fi
+    if [[ "$out" == *"__NO_HTTP_TOOL__"* ]]; then
+        print_result "$src_namespace" "$src_name" "$host_network" "$service_account" "$netpol_count" "$netpol_match" "$dest_role" "$imds_ip" "$imds_port" "TEST_ERROR" "Probe pod has no curl; IMDS credential check inconclusive."
+        return
+    fi
+
+    local details_parts=()
+    [[ "$out" == *"__AWS_OK__"* ]] && details_parts+=("$(printf '%s\n' "$out" | grep '__AWS_OK__' | head -n1 | sed 's/^__AWS_OK__ //')")
+    [[ "$out" == *"__GCP_OK__"* ]] && details_parts+=("GCP metadata token retrievable")
+    [[ "$out" == *"__AZ_OK__"* ]] && details_parts+=("Azure MSI token retrievable")
+
+    if [[ ${#details_parts[@]} -gt 0 ]]; then
+        local details
+        printf -v details '%s; ' "${details_parts[@]}"
+        details="${details%'; '}"
+        print_result "$src_namespace" "$src_name" "$host_network" "$service_account" "$netpol_count" "$netpol_match" "$dest_role" "$imds_ip" "$imds_port" "EXPOSED_CREDS" "Cloud credentials retrievable via IMDS: $details. (SecretAccessKey/session/OAuth tokens withheld.)"
+    else
+        print_result "$src_namespace" "$src_name" "$host_network" "$service_account" "$netpol_count" "$netpol_match" "$dest_role" "$imds_ip" "$imds_port" "NOT_RETRIEVABLE" "IMDS reachable or not, but no cloud credentials retrieved from this pod."
+    fi
 }
 
 test_auth_status_https() {
@@ -341,6 +445,8 @@ if [[ "$OUTPUT_MODE" == "human" ]]; then
     echo "Testing connectivity from all running pods..."
     echo "Status legend:"
     echo "- EXPOSED: unauthenticated access succeeded."
+    echo "- EXPOSED_CREDS: cloud IMDS credentials retrievable from pod (opt-in --check-imds-creds)."
+    echo "- NOT_RETRIEVABLE: IMDS credential check did not obtain cloud credentials."
     echo "- AUTH_REQUIRED: endpoint reachable but requires auth."
     echo "- DENIED_WITHOUT_CREDS: reachable but denied by TLS/auth/path constraints."
     echo "- BLOCKED_OR_UNREACHABLE: network path blocked, timed out, or no route."
@@ -352,7 +458,12 @@ if [[ "$OUTPUT_MODE" == "human" ]]; then
     echo "- BLOCKED_OR_UNREACHABLE: curl/timeout rc in {6,7,28,124}"
     echo "- DENIED_WITHOUT_CREDS: curl rc in {51,58,60} or HTTP 400/404 in auth probe stage"
     echo "- TEST_ERROR: any other probe/exec failure or ambiguous rc"
-    echo "- EXPOSED findings are wrapped with =========ALERT========= lines."
+    echo "- EXPOSED / EXPOSED_CREDS findings are wrapped with =========ALERT========= lines."
+    if [[ "$CHECK_IMDS_CREDS" -eq 1 ]]; then
+        echo "IMDS credential probe: ENABLED (--check-imds-creds). Secrets redacted by design."
+    else
+        echo "IMDS credential probe: disabled (pass --check-imds-creds to enable)."
+    fi
     echo "Format: SRC_NS | SRC_POD | HOSTNETWORK | SERVICEACCOUNT | NETPOL_NS_COUNT | NETPOL_MATCH | POLICY_ENGINE | PLUGIN_POLICY_COUNT | PLUGIN_POLICY_REFS | DEST_ROLE | DEST_IP | PORT | STATUS | DETAILS"
     echo "Pre-check: API=$PRE_API_HEALTH | NODE_COUNT=$PRE_NODE_COUNT"
     echo "---------------------------------------------------------------------"
@@ -535,6 +646,10 @@ for pod_rec in "${RUNNING_PODS[@]}"; do
         NODE_ROLE=$(resolve_node_role "$ip")
         test_connection_simple "$src_namespace" "$src_name" "$host_network" "$service_account" "$netpol_count" "$netpol_match" "$NODE_ROLE" "$ip" "$KUBELET_HTTP_RO_PORT"
     done
+
+    if [[ "$CHECK_IMDS_CREDS" -eq 1 ]]; then
+        test_imds_creds "$src_namespace" "$src_name" "$host_network" "$service_account" "$netpol_count" "$netpol_match"
+    fi
 done
 
 POST_NODE_COUNT=$("$KCLI" get nodes --no-headers 2>/dev/null | wc -l | tr -d ' ')

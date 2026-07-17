@@ -42,6 +42,10 @@ For cloud targets, use the cloud-specific script variants (`EKS-*`, `GKE-*`, `AK
 
 RBAC scripts answer: **who can perform high-risk API actions** (cluster-admin, secrets, exec, token minting, wildcards, CRD exposure heuristics, etc.). Each script documents semantics in its file header (bindings, `via =/≠`, excluded namespaces).
 
+High-value permission checks also print a one-line **attack path** (e.g. `exec into pod -> run arbitrary commands -> lateral movement`) under the `Checking:` line when a catalogue entry exists.
+
+Optional subject-name noise reduction uses [`identity_baseline.conf`](identity_baseline.conf) (see Details appendix).
+
 ### Container capabilities / PSA scripts
 
 | Script | Target | Notes |
@@ -54,6 +58,8 @@ RBAC scripts answer: **who can perform high-risk API actions** (cluster-admin, s
 
 These scripts inspect **declared** pod/namespace state. They are **not** full admission-controller or runtime-enforcement audits; each run prints an `[INFO]` line stating that (and that cloud identity columns are in-cluster hints, not cloud IAM).
 
+They also flag **capability escape chains** (declared-spec heuristic): e.g. `SYS_ADMIN` + writable cgroup hostPath, `SYS_PTRACE` + `shareProcessNamespace`, `NET_RAW`/`NET_ADMIN` + `hostNetwork`, `MKNOD` + writable `/dev` hostPath, or `SYS_MODULE` alone — raised to CRITICAL alongside existing capability WARNINGs.
+
 ---
 
 ## Other scripts (quick reference)
@@ -64,6 +70,7 @@ These scripts inspect **declared** pod/namespace state. They are **not** full ad
 - Requires `jq`, `curl`, `timeout`; supports `--namespaces`, `--output`, timeout flags, and `--max-pods`.
 - Modes: `full` (control-plane + worker checks) and `worker_only` (worker checks only).
 - Outputs human table or JSONL; high-risk `EXPOSED` findings are clearly highlighted.
+- Optional **`--check-imds-creds`**: from each probed pod, attempt AWS/GCP/Azure IMDS credential retrieval. Reports `EXPOSED_CREDS` or `NOT_RETRIEVABLE`; SecretAccessKey / session / OAuth tokens are **never** printed (masked prefixes only).
 - For full status taxonomy and probe logic, see the script header comments.
 
 ---
@@ -241,6 +248,22 @@ kubectl get ns
 - Checks **3–19** reuse one prefetch of RBAC objects.
 - `--checks=1` and/or `2` skips that prefetch path.
 
+**Identity baseline (`identity_baseline.conf`)**
+
+- Optional subject-name allowlist used by all `*-RBAC.sh` / `OpenShift-RBAC.sh` scripts.
+- Format: `IDENTITY_GLOB | SOURCE/REASON` (shell globs against the bare subject name).
+- Missing file ⇒ empty allowlist (behavior unchanged). Override path with `IDENTITY_BASELINE_FILE=/path/to/file`.
+- This is coarser than a permission-scoped vendor baseline: incomplete entries cause **false positives** (extra noise), never false negatives (hidden risks).
+- Matching subjects are skipped at the same filter sites that already suppress `system:*` / excluded-namespace subjects.
+
+**Attack-path phrasing**
+
+- `check_permission()` looks up `verbs:resource` in an `ATTACK_PATH` map and prints `Attack path: …` for seeded high-value checks (exec, escalate/bind/impersonate, secrets, webhooks, TokenReview/SubjectAccessReview, SA token minting).
+
+**Capability escape chains**
+
+- Declared-spec only: combines requested capabilities with co-conditions (`shareProcessNamespace`, `hostNetwork`, writable hostPath mounts). Not a runtime escape proof.
+
 **Cloud “Check 2” scope**
 
 - **EKS:** reads **`kube-system/aws-auth`** mappings to **`system:masters`** (not a full AWS/EKS IAM inventory).
@@ -253,7 +276,8 @@ kubectl get ns
 ## Limitations (summary)
 
 - RBAC audits reflect **Kubernetes RBAC** (plus the **documented** cloud slices for Check 2 on GKE/AKS, and **aws-auth** on EKS). They are not complete cloud IAM inventories.
-- Capabilities scripts use **pod spec + namespace labels**, not live admission results.
+- Capabilities scripts use **pod spec + namespace labels**, not live admission results; escape-chain findings are the same class of heuristic.
+- `--check-imds-creds` actively probes metadata endpoints from pods; use only on clusters you own/operate.
 - Terraform configs are for **labs** (e.g. single-node pools, permissive test namespaces). Harden before production use.
 
 For full behavior, semantics, and check IDs, use **`--help`** and **`--list-checks`** on each RBAC script and read the **header comments** at the top of each file.

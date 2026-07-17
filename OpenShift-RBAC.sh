@@ -219,6 +219,80 @@ is_excluded_ns() {
 }
 
 ##############################################
+# Attack-path phrases for high-value checks
+##############################################
+# Keys match check_permission args: "verbs_in:resource"
+declare -A ATTACK_PATH=(
+  ["create:pods/exec"]="exec into pod -> run arbitrary commands -> lateral movement / data exfiltration"
+  ["escalate:clusterroles"]="escalate ClusterRole -> grant privileges subject does not hold -> cluster takeover"
+  ["bind:clusterrolebindings"]="bind ClusterRoleBinding -> attach any ClusterRole to any subject -> privilege escalation"
+  ["bind:rolebindings"]="bind RoleBinding -> attach any Role/ClusterRole in scope -> privilege escalation"
+  ["impersonate:users"]="impersonate user -> act as another identity -> bypass RBAC"
+  ["impersonate:groups"]="impersonate group -> inherit group privileges -> bypass RBAC"
+  ["impersonate:serviceaccounts"]="impersonate ServiceAccount -> assume pod identity -> lateral movement"
+  ["impersonate:userextras"]="impersonate user extras -> forge authn attributes -> bypass RBAC"
+  ["get,list,watch:secrets"]="read Secrets -> harvest credentials/tokens/TLS keys -> account takeover"
+  ["get,list,watch,*:secrets"]="read Secrets -> harvest credentials/tokens/TLS keys -> account takeover"
+  ["create:validatingwebhookconfigurations"]="create ValidatingWebhook -> intercept/deny API requests cluster-wide -> persistence or DoS"
+  ["delete:validatingwebhookconfigurations"]="delete ValidatingWebhook -> remove admission controls -> weaken cluster policy"
+  ["update:validatingwebhookconfigurations"]="update ValidatingWebhook -> rewrite admission logic -> silent request mutation/denial"
+  ["patch:validatingwebhookconfigurations"]="patch ValidatingWebhook -> rewrite admission logic -> silent request mutation/denial"
+  ["create:mutatingwebhookconfigurations"]="create MutatingWebhook -> rewrite objects on admission -> persistence / backdoor"
+  ["delete:mutatingwebhookconfigurations"]="delete MutatingWebhook -> remove mutation controls -> weaken cluster policy"
+  ["update:mutatingwebhookconfigurations"]="update MutatingWebhook -> rewrite objects on admission -> persistence / backdoor"
+  ["patch:mutatingwebhookconfigurations"]="patch MutatingWebhook -> rewrite objects on admission -> persistence / backdoor"
+  ["create:tokenreviews"]="create TokenReview -> validate arbitrary bearer tokens -> credential probing"
+  ["create:subjectaccessreviews"]="create SubjectAccessReview -> enumerate other identities' permissions -> privilege mapping"
+  ["create:serviceaccounts/token"]="mint ServiceAccount token -> obtain long-lived credentials for another SA -> identity theft"
+)
+
+##############################################
+# Optional identity baseline (subject-name allowlist)
+##############################################
+# Loaded from identity_baseline.conf next to this script (or IDENTITY_BASELINE_FILE).
+# Missing file => empty allowlist (unchanged behavior).
+IDENTITY_BASELINE_GLOBS=()
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IDENTITY_BASELINE_FILE="${IDENTITY_BASELINE_FILE:-$SCRIPT_DIR/identity_baseline.conf}"
+
+load_identity_baseline() {
+  IDENTITY_BASELINE_GLOBS=()
+  local f="$IDENTITY_BASELINE_FILE"
+  [[ -f "$f" ]] || return 0
+  local line glob
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" != *"|"* ]]; then
+      continue
+    fi
+    glob="${line%%|*}"
+    glob="$(echo "$glob" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [[ -z "$glob" ]] && continue
+    IDENTITY_BASELINE_GLOBS+=("$glob")
+  done < "$f"
+  if [[ ${#IDENTITY_BASELINE_GLOBS[@]} -gt 0 && $QUIET -eq 0 ]]; then
+    echo "[INFO] Loaded ${#IDENTITY_BASELINE_GLOBS[@]} identity baseline pattern(s) from $f"
+    echo
+  fi
+}
+
+is_baseline_identity() {
+  local name="$1"
+  local pat
+  [[ -z "$name" ]] && return 1
+  for pat in "${IDENTITY_BASELINE_GLOBS[@]}"; do
+    # shellcheck disable=SC2254
+    case "$name" in
+      $pat) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+load_identity_baseline
+
+
+##############################################
 # Helper: Get subjects for a role or binding
 ##############################################
 # Resolves all subjects bound to a given role by name.
@@ -356,8 +430,12 @@ check_permission() {
     local resource="$2"
     local msg="$3"
     local empty_msg="${4:-✔ No matching roles found.}"
+    local ap_key="${verbs_in}:${resource}"
 
     echo "Checking: $msg ($verbs_in $resource)"
+    if [[ -n "${ATTACK_PATH[$ap_key]:-}" ]]; then
+      echo "  Attack path: ${ATTACK_PATH[$ap_key]}"
+    fi
 
     # Fetch all ClusterRoles and Roles
     matches=$($OC get clusterrole,role -A -o json \
@@ -433,6 +511,7 @@ check_permission() {
             subj_name=$(echo "$subj" | awk '{print $2}')
             is_excluded_ns "$subj_ns" && continue
             [[ "$subj_name" == system:* ]] && continue
+            is_baseline_identity "$subj_name" && continue
             echo "$subj"
         done)
 
@@ -584,6 +663,7 @@ else
             subj_name=$(echo "$subj" | awk '{print $2}')
             is_excluded_ns "$subj_ns" && continue
             [[ "$subj_name" == system:* ]] && continue
+            is_baseline_identity "$subj_name" && continue
             echo "$subj"
         done)
 
@@ -703,6 +783,7 @@ for TARGET_NS in "${SYSTEM_CONFIGMAP_NAMESPACES[@]}"; do
           subj_name=$(echo "$subj" | awk '{print $2}')
           is_excluded_ns "$subj_ns" && continue
           [[ "$subj_name" == system:* ]] && continue
+          is_baseline_identity "$subj_name" && continue
           echo "    * $subj"
         done
     done
@@ -739,6 +820,7 @@ for TARGET_NS in "${SYSTEM_CONFIGMAP_NAMESPACES[@]}"; do
           subj_name=$(echo "$subj" | awk '{print $2}')
           is_excluded_ns "$subj_ns" && continue
           [[ "$subj_name" == system:* ]] && continue
+          is_baseline_identity "$subj_name" && continue
           echo "    * $subj"
         done
     done

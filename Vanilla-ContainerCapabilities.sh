@@ -48,6 +48,7 @@ fi
 
 echo "Running Kubernetes security audit (PSA + pod-spec capabilities)..."
 echo "[INFO] Pod-spec + PSA labels only (not live admission); no cloud identity column in this script."
+echo "[INFO] Escape-chain detection is a declared-spec heuristic (cap + co-condition), not runtime verification."
 [[ "$ONLY_USER_NS" -eq 1 ]] && echo "Filtering: only non-system namespaces (not openshift-* / kube-*)."
 echo ""
 
@@ -75,6 +76,50 @@ cap_in_baseline_union () {
 status_push () {
     STATUS_RANKS+=("$1")
     STATUS_MSGS+=("$2")
+}
+
+# Escape-chain detection: capability + enabling co-condition => CRITICAL.
+# Uses REQUESTED_CAPS_ARRAY, HOST_NET, SHARE_PROC_NS, HOSTPATH_WRITABLE_PATHS.
+check_escape_chains () {
+    local cap path has_sys_admin=0 has_sys_ptrace=0 has_sys_module=0 has_net=0 has_mknod=0
+    local cg_hits=() dev_hits=()
+
+    for cap in "${REQUESTED_CAPS_ARRAY[@]}"; do
+        [[ -z "$cap" ]] && continue
+        case "$(printf '%s' "$cap" | tr '[:lower:]' '[:upper:]')" in
+            SYS_ADMIN) has_sys_admin=1 ;;
+            SYS_PTRACE) has_sys_ptrace=1 ;;
+            SYS_MODULE) has_sys_module=1 ;;
+            NET_RAW|NET_ADMIN) has_net=1 ;;
+            MKNOD) has_mknod=1 ;;
+        esac
+    done
+
+    for path in "${HOSTPATH_WRITABLE_PATHS[@]}"; do
+        [[ -z "$path" ]] && continue
+        if [[ "$path" == /sys/fs/cgroup || "$path" == /sys/fs/cgroup/* || "$path" == /sys/fs || "$path" == /sys/fs/* ]]; then
+            cg_hits+=("$path")
+        fi
+        if [[ "$path" == /dev || "$path" == /dev/* ]]; then
+            dev_hits+=("$path")
+        fi
+    done
+
+    if [[ "$has_sys_admin" -eq 1 && ${#cg_hits[@]} -gt 0 ]]; then
+        status_push 5 "CRITICAL: escape chain SYS_ADMIN + writable cgroup hostPath ($(IFS=,; echo "${cg_hits[*]}")) -> release_agent write -> host command execution"
+    fi
+    if [[ "$has_sys_ptrace" -eq 1 && "$SHARE_PROC_NS" == "true" ]]; then
+        status_push 5 "CRITICAL: escape chain SYS_PTRACE + shareProcessNamespace -> attach to sibling container process -> credential/memory extraction"
+    fi
+    if [[ "$has_net" -eq 1 && "$HOST_NET" == "true" ]]; then
+        status_push 5 "CRITICAL: escape chain NET_RAW/NET_ADMIN + hostNetwork -> sniff/spoof node network -> reach metadata API"
+    fi
+    if [[ "$has_mknod" -eq 1 && ${#dev_hits[@]} -gt 0 ]]; then
+        status_push 5 "CRITICAL: escape chain MKNOD + writable /dev hostPath ($(IFS=,; echo "${dev_hits[*]}")) -> create host device node -> raw disk read"
+    fi
+    if [[ "$has_sys_module" -eq 1 ]]; then
+        status_push 5 "CRITICAL: escape chain SYS_MODULE -> load kernel module -> full host compromise"
+    fi
 }
 
 # -----------------------------
@@ -165,6 +210,26 @@ while read -r NS; do
             | any(. == true)
             | tostring | ascii_downcase
         ')
+
+        SHARE_PROC_NS=$(echo "$POD_JSON" | jq -r '.spec.shareProcessNamespace // false | tostring | ascii_downcase')
+
+        # Writable hostPath mount paths (volume hostPath.path joined to container mounts with readOnly!=true)
+        mapfile -t HOSTPATH_WRITABLE_PATHS < <(echo "$POD_JSON" | jq -r '
+            ((.spec.volumes // []) | map(select(.hostPath != null) | {name, path: .hostPath.path})) as $hp |
+            [
+              (.spec.initContainers // [])[],
+              (.spec.containers // [])[],
+              (.spec.ephemeralContainers // [])[]
+            ] as $ctrs |
+            [
+              $ctrs[]
+              | (.volumeMounts // [])[] as $vm
+              | select($vm.readOnly != true)
+              | ($hp[] | select(.name == $vm.name) | .path)
+            ]
+            | map(select(. != null and . != ""))
+            | unique[]?
+        ' || true)
 
         SA_NAME=$(echo "$POD_JSON" | jq -r '.spec.serviceAccountName // "default"')
 
@@ -391,6 +456,9 @@ while read -r NS; do
         fi
         [[ "$DROP_ALL" -eq 1 && "$PRIV" != "true" ]] && status_push 1 "INFO: capabilities.drop includes ALL (non-privileged pod spec)"
 
+        # Escape chains before generic cap classification so CRITICAL coexists with WARNING/MEDIUM.
+        check_escape_chains
+
         PRIV_REQ_CAPS=()
         NONBASE_REQ_CAPS=()
         for cap in "${REQUESTED_CAPS_ARRAY[@]}"; do
@@ -435,7 +503,7 @@ while read -r NS; do
             STATUS="$STATUS (violates restricted PSA enforce profile)"
         fi
 
-        [[ "$DEBUG" -eq 1 ]] && echo "DEBUG pod=$NS/$POD PRIV=$PRIV DROP_ALL=$DROP_ALL FINDINGS=$FINDING_COUNT STATUS=$STATUS"
+        [[ "$DEBUG" -eq 1 ]] && echo "DEBUG pod=$NS/$POD PRIV=$PRIV DROP_ALL=$DROP_ALL SHARE_PROC_NS=$SHARE_PROC_NS FINDINGS=$FINDING_COUNT STATUS=$STATUS"
 
         PRIV_DISPLAY=$([[ "$PRIV" == "true" ]] && echo "true" || echo "false")
         ESC_DISPLAY=$([[ "$ESC" == "true" ]] && echo "true" || echo "false")
