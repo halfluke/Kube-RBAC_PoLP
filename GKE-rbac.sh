@@ -163,7 +163,7 @@ START_TIME_NS=$(date +%s%N)
 # HIGH-VALUE CHECKS:
 # ------------------
 #   1  → system:masters exposures in RBAC
-#   2  → Optional GCP IAM slice from gcloud get-iam-policy on the cluster resource (not full GCP admin map)
+#   2  → Optional GCP IAM slice from gcloud projects get-iam-policy (not full GCP admin map)
 #   4  → Non-system users with cluster-admin
 #   6  → pod exec
 #   9  → secrets read (get/list/watch)
@@ -198,10 +198,12 @@ START_TIME_NS=$(date +%s%N)
 # • “from:” shows WHERE bindings were found, not privilege flow.
 # • A role with no subjects is ignored — it exposes nothing.
 # • Allowlisted roles are expected controller noise.
-# • GKE check 2 (optional): gcloud on PATH + GKE_PROJECT, GKE_CLUSTER_NAME, GKE_LOCATION
-#   (region or zone). Lists bindings returned by get-iam-policy on the **cluster resource** for
-#   roles/container.clusterAdmin and container.admin only—not every path to cluster admin (e.g. project/folder/org
-#   roles, Owner/Editor, other roles). Does not replace IAM Recommender or org policy review.
+# • GKE check 2 (optional): gcloud on PATH + GKE_PROJECT. Lists project IAM bindings for
+#   roles/owner, roles/editor, roles/container.clusterAdmin, and roles/container.admin.
+#   GKE has no gcloud container clusters get-iam-policy (cluster-resource IAM is not exposed
+#   that way); project/folder/org roles are the real cloud admin path. Does not replace
+#   IAM Recommender or org policy review. GKE_CLUSTER_NAME / GKE_LOCATION are unused for Check 2
+#   but still used for get-credentials / other docs.
 # • GKE checks 20–21 skip curated GKE ClusterRoleBinding names unless
 #   GKE_INCLUDE_MANAGED_DEFAULT_BINDINGS=1. Check 22 flags WI-annotated SAs with risky RBAC.
 #
@@ -352,9 +354,9 @@ Description:
   This script performs a comprehensive RBAC audit of a Kubernetes/GKE
   cluster, including secret/credential CRD exposure, wildcard detection,
   pod exec & sensitive subresources, token minting, cluster-admin misuse,
-  Check 2 is optional: it lists clusterAdmin/container.admin members on the cluster resource via
-  gcloud get-iam-policy—not a full map of GCP access to the cluster (parent-scope roles may be missing).
-  Needs gcloud and GKE_PROJECT, GKE_CLUSTER_NAME, GKE_LOCATION (see output when prerequisites are missing).
+  Check 2 is optional: it lists Owner/Editor/container.admin/clusterAdmin members on the GCP
+  project via gcloud projects get-iam-policy—not a full map of GCP access (folder/org roles may
+  be missing). Needs gcloud and GKE_PROJECT (see output when prerequisites are missing).
   Check 22 flags WI-annotated SAs that also
   have risky RBAC. GKE-managed ClusterRoleBindings are skipped in checks 20–21
   unless GKE_INCLUDE_MANAGED_DEFAULT_BINDINGS=1. See header comments.
@@ -423,7 +425,7 @@ if [[ $LIST_CHECKS -eq 1 ]]; then
   cat <<'EOF'
 Available checks (use --checks to select, comma-separated, ranges allowed):
   1  : RBAC bindings referencing system:masters (ClusterRoleBindings/RoleBindings)
-  2  : Optional GCP IAM — clusterAdmin & container.admin on cluster resource via gcloud (needs gcloud + env; not full GCP map)
+  2  : Optional GCP IAM — Owner/Editor/clusterAdmin/container.admin on the project via gcloud (needs gcloud + GKE_PROJECT; not full GCP map)
   3  : System groups do NOT have cluster-admin
   4  : No non-system subjects have cluster-admin
   5  : No custom subjects can create workload resources (pods/deployments/statefulsets)
@@ -465,12 +467,12 @@ echo " ⚠ Check reported potential issues"
 if [[ $QUIET -eq 0 ]]; then echo " ✔ OK / no issues"; fi
 echo " = Role name = binding name"
 echo " ≠ Role name ≠ binding name"
-echo " [known GKE platform break-glass] = GCP IAM clusterAdmin / container.admin path (still listed; not suppressed)"
+echo " [known GKE platform break-glass] = GCP IAM Owner/Editor/clusterAdmin/container.admin path (still listed; not suppressed)"
 echo
 echo "Platform break-glass (documented, not filtered):"
-echo "  • Check 2: GCP IAM roles/container.clusterAdmin and roles/container.admin on the cluster resource"
+echo "  • Check 2: GCP project IAM roles/owner, roles/editor, roles/container.clusterAdmin, roles/container.admin"
 echo "  • ClusterRole/cluster-admin and Group system:masters bindings (Kubernetes break-glass)"
-echo "  • GKE has no AKS-style ClusterRole/aks-service; cloud break-glass is mainly Check 2 GCP IAM"
+echo "  • GKE has no AKS-style ClusterRole/aks-service; cloud break-glass is mainly Check 2 GCP project IAM"
 echo
 
 ##############################################
@@ -914,58 +916,55 @@ if should_run 1; then
   echo
 fi
 
-# Check 2: Optional GCP IAM bindings on the GKE cluster resource only (analogue to EKS aws-auth / AKS Azure RBAC slice).
-# get-iam-policy on the cluster does not include every admin path (project/folder/org; other role types).
-# Requires: gcloud on PATH, GKE_PROJECT, GKE_CLUSTER_NAME, GKE_LOCATION (region or zone).
+# Check 2: Optional GCP project IAM (analogue to EKS aws-auth / AKS Azure RBAC slice).
+# GKE does not expose gcloud container clusters get-iam-policy; cloud admin is project/folder/org IAM.
+# Requires: gcloud on PATH, GKE_PROJECT (resourcemanager.projects.getIamPolicy).
 if should_run 2; then
-  echo "2: GCP cluster IAM (optional — high-privilege bindings on the cluster resource)"
+  echo "2: GCP project IAM (optional — high-privilege bindings on the project)"
 
-  if command -v gcloud >/dev/null 2>&1 \
-     && [[ -n "${GKE_PROJECT:-}" ]] && [[ -n "${GKE_CLUSTER_NAME:-}" ]] && [[ -n "${GKE_LOCATION:-}" ]]; then
+  if command -v gcloud >/dev/null 2>&1 && [[ -n "${GKE_PROJECT:-}" ]]; then
     if [[ $QUIET -eq 0 ]]; then
-      echo " (Check 2 scope: gcloud get-iam-policy on this cluster resource only; not full GCP admin picture—see script header.)"
+      echo " (Check 2 scope: gcloud projects get-iam-policy for this project; not folder/org IAM—see script header.)"
     fi
     pol=""
-    if pol=$(gcloud container clusters get-iam-policy "$GKE_CLUSTER_NAME" \
-        --project="$GKE_PROJECT" --region="$GKE_LOCATION" --format=json 2>/dev/null); then
-      :
-    elif pol=$(gcloud container clusters get-iam-policy "$GKE_CLUSTER_NAME" \
-        --project="$GKE_PROJECT" --zone="$GKE_LOCATION" --format=json 2>/dev/null); then
-      :
-    else
+    if ! pol=$(gcloud projects get-iam-policy "$GKE_PROJECT" --format=json 2>/dev/null); then
       pol=""
     fi
     if [[ -z "$pol" ]]; then
       if [[ $QUIET -eq 0 ]]; then
-        echo " ⚠ Could not read cluster IAM policy via gcloud."
-        echo "   Verify: GKE_LOCATION matches a regional cluster (--region) or zonal cluster (--zone),"
-        echo "   gcloud auth applies, and your principal has permission container.clusters.getIamPolicy."
+        echo " ⚠ Could not read project IAM policy via gcloud."
+        echo "   Verify: gcloud auth applies, GKE_PROJECT is correct, and your principal can call"
+        echo "   resourcemanager.projects.getIamPolicy (e.g. roles/viewer or stronger on the project)."
       fi
     else
       iam_out=$(echo "$pol" | jq -r '
         .bindings[]?
-        | select(.role == "roles/container.clusterAdmin" or .role == "roles/container.admin")
+        | select(
+            .role == "roles/owner"
+            or .role == "roles/editor"
+            or .role == "roles/container.clusterAdmin"
+            or .role == "roles/container.admin"
+          )
         | .role as $r
         | (.members // [])[]
         | " • GCP IAM \($r) -> \(.) [known GKE platform break-glass / cloud IAM]"
       ' 2>/dev/null || true)
       if [[ -n "$iam_out" ]]; then
-        echo " GCP cluster IAM bindings (review for least privilege; tagged as known platform break-glass / cloud IAM):"
+        echo " GCP project IAM bindings (review for least privilege; tagged as known platform break-glass / cloud IAM):"
         printf '%s\n' "$iam_out"
       elif [[ $QUIET -eq 0 ]]; then
-        echo " ✔ No roles/container.clusterAdmin or roles/container.admin bindings on this cluster resource."
+        echo " ✔ No roles/owner, roles/editor, roles/container.clusterAdmin, or roles/container.admin bindings on this project."
       fi
     fi
   elif [[ $QUIET -eq 0 ]]; then
-    echo " Check 2 not run (optional): prerequisites for GCP cluster IAM audit:"
-    echo "   • gcloud installed and on PATH, with an account that can call get-iam-policy on the cluster"
-    echo "   • GKE_PROJECT        — GCP project ID (e.g. my-gcp-project)"
-    echo "   • GKE_CLUSTER_NAME   — Cluster name as shown by: gcloud container clusters list"
-    echo "   • GKE_LOCATION       — Region (e.g. us-central1) for regional clusters, or zone (e.g. us-central1-a) for zonal"
-    echo "   • jq                 — required to parse policy JSON (same as rest of this script)"
-    echo " When run: only bindings returned for the cluster resource (parent IAM may grant access without appearing here)."
+    echo " Check 2 not run (optional): prerequisites for GCP project IAM audit:"
+    echo "   • gcloud installed and on PATH, with an account that can call projects get-iam-policy"
+    echo "   • GKE_PROJECT — GCP project ID (e.g. my-gcp-project)"
+    echo "   • jq          — required to parse policy JSON (same as rest of this script)"
+    echo " When run: lists Owner/Editor/container.admin/clusterAdmin on the project only"
+    echo " (folder/org IAM may grant access without appearing here)."
     echo " Example:"
-    echo "   GKE_PROJECT=my-proj GKE_CLUSTER_NAME=my-cluster GKE_LOCATION=us-central1 $0 --checks=2"
+    echo "   GKE_PROJECT=my-proj $0 --checks=2"
   fi
   echo
 fi

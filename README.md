@@ -4,7 +4,7 @@ Shell scripts that audit **Kubernetes RBAC** and **workload security** (PSA labe
 
 **Use for labs and learning only** — not a replacement for cloud IAM reviews, admission controllers, or org policy.
 
-**Testing status:** Heavily used on **local Kubernetes** and **OpenShift** (older tree). **AKS** scripts and the `terraform/aks` lab stack have been validated end-to-end (apply → audits → destroy). **EKS / GKE** paths and Terraform are newer; treat those cloud runs as best-effort until you validate on your subscription.
+**Testing status:** Heavily used on **local Kubernetes** and **OpenShift** (older tree). **AKS** and **GKE** scripts and their Terraform lab stacks have been validated end-to-end (apply → audits → destroy). **EKS** paths and Terraform are newer; treat those runs as best-effort until you validate on your account.
 
 ---
 
@@ -217,7 +217,7 @@ Same flags work on `EKS-rbac.sh`, `GKE-rbac.sh`, `AKS-rbac.sh`, `OpenShift-RBAC.
 | Cloud | Extra env before RBAC script |
 |-------|------------------------------|
 | EKS | *(none)* — uses `kube-system/aws-auth` via kubectl |
-| GKE | `GKE_PROJECT`, `GKE_CLUSTER_NAME`, `GKE_LOCATION` |
+| GKE | `GKE_PROJECT` (project IAM; cluster name/location not required for Check 2) |
 | AKS | `AKS_RESOURCE_GROUP`, `AKS_CLUSTER_NAME` |
 
 Without those exports, most RBAC checks still run; Check 2 is skipped or thin on GKE/AKS.
@@ -314,11 +314,14 @@ Check 2 needs **cloud env vars** in the same shell as the script:
 export AKS_RESOURCE_GROUP="$(terraform output -raw resource_group_name)"
 export AKS_CLUSTER_NAME="$(terraform output -raw cluster_name)"
 
-# GKE (from terraform/gke)
+# GKE Check 2 only needs the project (from terraform/gke)
 export GKE_PROJECT="$(terraform output -raw project_id)"
-export GKE_CLUSTER_NAME="$(terraform output -raw cluster_name)"
-export GKE_LOCATION="$(terraform output -raw zone)"   # must match cluster location
+# Optional helpers for get-credentials / docs:
+# export GKE_CLUSTER_NAME="$(terraform output -raw cluster_name)"
+# export GKE_LOCATION="$(terraform output -raw zone)"
 ```
+
+Also install **`gke-gcloud-auth-plugin`** (`sudo apt install google-cloud-cli-gke-gcloud-auth-plugin` when gcloud is from apt) so Terraform’s Kubernetes provider and kubectl can authenticate to GKE.
 
 **EKS** Check 2 needs no extra exports — only a working kubectl context.
 
@@ -345,8 +348,8 @@ Note the **exact command**, **cloud + region from `terraform.tfvars`**, and the 
 Not a full cloud IAM audit — only a **small, documented slice**:
 
 - **EKS:** `aws-auth` / `system:masters` mappings  
-- **GKE:** cluster IAM (`clusterAdmin` / `container.admin` on the cluster resource)  
-- **AKS:** Azure role assignments on the AKS cluster resource  
+- **GKE:** project IAM (`Owner` / `Editor` / `container.clusterAdmin` / `container.admin` on the GCP project; GKE has no cluster-resource `get-iam-policy`)
+- **AKS:** Azure role assignments on the AKS cluster resource
 
 ### Known platform break-glass (annotated in output)
 
@@ -356,7 +359,7 @@ Cloud RBAC scripts **do not hide** vendor break-glass paths. They **tag** them s
 |-------|------------------|
 | **AKS** | `ClusterRole/aks-service`, Users `aks-support` / `clusterAdmin` / `clusterUser`; Check 2 Azure RBAC hits; `cluster-admin` |
 | **EKS** | Check 2 `aws-auth` → `system:masters`; Check 1 `system:masters` bindings; `cluster-admin` (no AKS-style `aks-service` role) |
-| **GKE** | Check 2 GCP `container.clusterAdmin` / `container.admin`; Check 1 `system:masters`; `cluster-admin` |
+| **GKE** | Check 2 GCP project `Owner` / `Editor` / `container.clusterAdmin` / `container.admin`; Check 1 `system:masters`; `cluster-admin` |
 
 Look for the suffix `[known … platform break-glass]` (or `[known Kubernetes break-glass ClusterRole]`). These remain listed on purpose.
 

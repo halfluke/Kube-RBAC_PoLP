@@ -14,7 +14,7 @@ resource "kubernetes_service_account" "rbac_audit" {
   count = var.deploy_rbac_test_fixtures ? 1 : 0
 
   metadata {
-    name      = "vanilla-rbac-audit-sa"
+    name      = "gke-rbac-audit-sa"
     namespace = var.rbac_test_namespace
   }
 
@@ -25,7 +25,7 @@ resource "kubernetes_role" "pods_exec" {
   count = var.deploy_rbac_test_fixtures ? 1 : 0
 
   metadata {
-    name      = "vanilla-rbac-test-pods-exec"
+    name      = "gke-rbac-test-pods-exec"
     namespace = var.rbac_test_namespace
   }
 
@@ -42,7 +42,7 @@ resource "kubernetes_role_binding" "pods_exec" {
   count = var.deploy_rbac_test_fixtures ? 1 : 0
 
   metadata {
-    name      = "vanilla-rbac-test-pods-exec"
+    name      = "gke-rbac-test-pods-exec"
     namespace = var.rbac_test_namespace
   }
 
