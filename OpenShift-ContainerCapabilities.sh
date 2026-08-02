@@ -1,7 +1,7 @@
 #!/bin/bash
 
 echo "Performing SCC + capabilities check (./jq-linux-amd64-only, '*' expanded)..."
-echo "[INFO] Escape-chain detection is a declared-spec heuristic (cap + co-condition), not runtime verification."
+echo "[INFO] Escape-chain lines use the pod-spec effective-cap estimate and are listed separately from Status severity (not runtime verification)."
 
 # -----------------------------
 # Flags / argument parsing
@@ -76,20 +76,24 @@ cap_in_baseline_union () {
   containsElement "$c" "${BASELINE_PRIVILEGED_CAPS[@]}"
 }
 
+escape_chain_push () {
+  ESCAPE_CHAIN_MSGS+=("$1")
+}
+
 # Per-pod STATUS: rank 5=CRITICAL … 2=MEDIUM (same ladder as Vanilla); merge picks worst rank + " — also: " for ties.
 status_push () {
   STATUS_RANKS+=("$1")
   STATUS_MSGS+=("$2")
 }
 
-# Escape-chain detection: capability + enabling co-condition => CRITICAL.
-# Uses REQUESTED_CAPS_ARRAY, HOST_NETWORK_CHECK, SHARE_PROC_NS, HOSTPATH_WRITABLE_PATHS.
+# Escape-chain detection: estimated effective caps + co-conditions (separate from Status severity).
+# Uses EFFECTIVE_CAPS, HOST_NETWORK_CHECK, SHARE_PROC_NS, HOSTPATH_WRITABLE_PATHS.
 check_escape_chains () {
     local cap path has_sys_admin=0 has_sys_ptrace=0 has_sys_module=0 has_net=0 has_mknod=0
     local cg_hits=() dev_hits=()
     local host_net="${HOST_NETWORK_CHECK:-false}"
 
-    for cap in "${REQUESTED_CAPS_ARRAY[@]}"; do
+    for cap in "${EFFECTIVE_CAPS[@]}"; do
         [[ -z "$cap" ]] && continue
         case "$(printf '%s' "$cap" | tr '[:lower:]' '[:upper:]')" in
             SYS_ADMIN) has_sys_admin=1 ;;
@@ -111,23 +115,23 @@ check_escape_chains () {
     done
 
     if [[ "$has_sys_admin" -eq 1 && ${#cg_hits[@]} -gt 0 ]]; then
-        status_push 5 "CRITICAL: escape chain SYS_ADMIN + writable cgroup hostPath ($(IFS=,; echo "${cg_hits[*]}")) -> release_agent write -> host command execution"
+        escape_chain_push "Escape chain: SYS_ADMIN + writable cgroup hostPath ($(IFS=,; echo "${cg_hits[*]}")) -> release_agent write -> host command execution"
     fi
     if [[ "$has_sys_ptrace" -eq 1 && "$SHARE_PROC_NS" == "true" ]]; then
-        status_push 5 "CRITICAL: escape chain SYS_PTRACE + shareProcessNamespace -> attach to sibling container process -> credential/memory extraction"
+        escape_chain_push "Escape chain: SYS_PTRACE + shareProcessNamespace -> attach to sibling container process -> credential/memory extraction"
     fi
     if [[ "$has_net" -eq 1 && "$host_net" == "true" ]]; then
-        status_push 5 "CRITICAL: escape chain NET_RAW/NET_ADMIN + hostNetwork -> sniff/spoof node network -> reach metadata API"
+        escape_chain_push "Escape chain: NET_RAW/NET_ADMIN + hostNetwork -> sniff/spoof node network -> reach metadata API"
     fi
     if [[ "$has_mknod" -eq 1 && ${#dev_hits[@]} -gt 0 ]]; then
-        status_push 5 "CRITICAL: escape chain MKNOD + writable /dev hostPath ($(IFS=,; echo "${dev_hits[*]}")) -> create host device node -> raw disk read"
+        escape_chain_push "Escape chain: MKNOD + writable /dev hostPath ($(IFS=,; echo "${dev_hits[*]}")) -> create host device node -> raw disk read"
     fi
     if [[ "$has_sys_module" -eq 1 ]]; then
-        status_push 5 "CRITICAL: escape chain SYS_MODULE -> load kernel module -> full host compromise"
+        escape_chain_push "Escape chain: SYS_MODULE -> load kernel module -> full host compromise"
     fi
 }
 
-[[ "$OUTPUT_MODE" == "csv" ]] && echo "namespace,pod,scc,serviceAccount,privileged_container,status,scc_caps,defaultAddCapabilities,requiredDropCapabilities,requested_caps_from_pod,dropped_caps_from_pod,effective_caps,allowPrivilegeEscalation,hostPID,hostNetwork,hostIPC,runAsNonRoot,runAsUser,automountServiceAccountToken"
+[[ "$OUTPUT_MODE" == "csv" ]] && echo "namespace,pod,scc,serviceAccount,privileged_container,status,scc_caps,defaultAddCapabilities,requiredDropCapabilities,requested_caps_from_pod,dropped_caps_from_pod,effective_caps,allowPrivilegeEscalation,hostPID,hostNetwork,hostIPC,runAsNonRoot,runAsUser,escape_chains,automountServiceAccountToken"
 
 JSON_ITEMS=()
 
@@ -511,7 +515,11 @@ while read -r NS; do
     [ -z "$NS" ] && continue
 
     IS_SYSTEM_NS=0
-    if [[ "$NS" == openshift-* ]] || [[ "$NS" == kube-* ]]; then IS_SYSTEM_NS=1; fi
+    # Reserved kube names only — not kube-* prefix (lab fixtures may use kube-rbac-polp-*).
+    if [[ "$NS" == openshift-* ]] \
+        || [[ "$NS" == "kube-system" || "$NS" == "kube-public" || "$NS" == "kube-node-lease" ]]; then
+        IS_SYSTEM_NS=1
+    fi
     [[ "$ONLY_USER_NS" -eq 1 && "$IS_SYSTEM_NS" -eq 1 ]] && continue
 
     # -----------------------------
@@ -1135,6 +1143,9 @@ while read -r NS; do
                 EFFECTIVE_CAPS_STR="${EFFECTIVE_CAPS_TAGGED[*]}"
         fi
 
+        ESCAPE_CHAIN_MSGS=()
+        check_escape_chains
+
         # -----------------------------
         # Status determination (ranked user-NS findings -> worst rank + " — also: " for ties; INFO_OK otherwise)
         STATUS_RANKS=()
@@ -1153,9 +1164,6 @@ while read -r NS; do
                 HOST_FLAG_JOIN_OSHIFT=$(IFS=,; echo "${HOST_FLAG_PARTS_OSHIFT[*]}")
                 status_push 4 "HIGH: host access enabled ($HOST_FLAG_JOIN_OSHIFT) in user namespace - Please VERIFY!!"
             fi
-
-            # Escape chains before generic cap classification so CRITICAL coexists with WARNING/MEDIUM.
-            check_escape_chains
 
             RUNASUSER_ZERO=0
             [[ "$POD_RUNASUSER" == "0" ]] && RUNASUSER_ZERO=1
@@ -1282,6 +1290,14 @@ while read -r NS; do
         [[ -z "$STATUS" ]] && STATUS="OK: no issues detected"
         [[ "$SCC_UNRESOLVED" -eq 1 ]] && STATUS+="; INFO: SCC unknown — pod-only capability estimate (not admission-accurate)"
 
+        if [[ ${#ESCAPE_CHAIN_MSGS[@]} -eq 0 ]]; then
+            ESCAPE_CHAINS_CSV=""
+            ESCAPE_CHAINS_JSON='[]'
+        else
+            ESCAPE_CHAINS_CSV=$(printf '%s; ' "${ESCAPE_CHAIN_MSGS[@]}" | sed 's/; $//')
+            ESCAPE_CHAINS_JSON=$(printf '%s\n' "${ESCAPE_CHAIN_MSGS[@]}" | ./jq-linux-amd64 -R . | ./jq-linux-amd64 -s .)
+        fi
+
         # -----------------------------
         # Output (8-space indentation)
         if [[ "$OUTPUT_MODE" == "text" ]]; then
@@ -1310,6 +1326,9 @@ while read -r NS; do
                 echo "        Dropped Caps from Pod: $DROPPED_CAPS_STR"
                 echo "        Effective Caps: $EFFECTIVE_CAPS_STR"
                 echo "        Status: $STATUS"
+                for _ec in "${ESCAPE_CHAIN_MSGS[@]}"; do
+                        echo "        $_ec"
+                done
                 echo ""
 
         elif [[ "$OUTPUT_MODE" == "csv" ]]; then
@@ -1331,6 +1350,7 @@ while read -r NS; do
                 HOST_IPC_DISPLAY_ESCAPED=${HOST_IPC_DISPLAY//\"/\"\"}
                 RUN_AS_NONROOT_DISPLAY_ESCAPED=${RUN_AS_NONROOT_DISPLAY//\"/\"\"}
                 RUN_AS_USER_DISPLAY_ESCAPED=${RUN_AS_USER_DISPLAY//\"/\"\"}
+                ESCAPE_CHAINS_ESCAPED=${ESCAPE_CHAINS_CSV//\"/\"\"}
 
                 # dynamic automount for CSV
                 if [[ $AUTOMOUNT_TRUE -eq 1 ]]; then
@@ -1339,7 +1359,7 @@ while read -r NS; do
                         AUTOMOUNT_DISPLAY_ESCAPED="false ($AUTOMOUNT_REASON)"
                 fi
 
-                echo "\"$NS_ESCAPED\",\"$POD_ESCAPED\",\"$SCC_NAME_ESCAPED\",\"$SA_NAME_ESCAPED\",\"$PRIV_TEXT_ESCAPED\",\"$STATUS_ESCAPED\",\"$SCC_CAPS_DISPLAY_ESCAPED\",\"$SCC_DEFAULT_ADD_DISPLAY_ESCAPED\",\"$SCC_REQUIRED_DROP_DISPLAY_ESCAPED\",\"$REQUESTED_CAPS_STR_ESCAPED\",\"$DROPPED_CAPS_STR_ESCAPED\",\"$EFFECTIVE_CAPS_STR_ESCAPED\",\"$ALLOW_PRIV_ESC_DISPLAY_ESCAPED\",\"$HOST_PID_DISPLAY_ESCAPED\",\"$HOST_NETWORK_DISPLAY_ESCAPED\",\"$HOST_IPC_DISPLAY_ESCAPED\",\"$RUN_AS_NONROOT_DISPLAY_ESCAPED\",\"$RUN_AS_USER_DISPLAY_ESCAPED\",\"$AUTOMOUNT_DISPLAY_ESCAPED\""
+                echo "\"$NS_ESCAPED\",\"$POD_ESCAPED\",\"$SCC_NAME_ESCAPED\",\"$SA_NAME_ESCAPED\",\"$PRIV_TEXT_ESCAPED\",\"$STATUS_ESCAPED\",\"$SCC_CAPS_DISPLAY_ESCAPED\",\"$SCC_DEFAULT_ADD_DISPLAY_ESCAPED\",\"$SCC_REQUIRED_DROP_DISPLAY_ESCAPED\",\"$REQUESTED_CAPS_STR_ESCAPED\",\"$DROPPED_CAPS_STR_ESCAPED\",\"$EFFECTIVE_CAPS_STR_ESCAPED\",\"$ALLOW_PRIV_ESC_DISPLAY_ESCAPED\",\"$HOST_PID_DISPLAY_ESCAPED\",\"$HOST_NETWORK_DISPLAY_ESCAPED\",\"$HOST_IPC_DISPLAY_ESCAPED\",\"$RUN_AS_NONROOT_DISPLAY_ESCAPED\",\"$RUN_AS_USER_DISPLAY_ESCAPED\",\"$ESCAPE_CHAINS_ESCAPED\",\"$AUTOMOUNT_DISPLAY_ESCAPED\""
 
         elif [[ "$OUTPUT_MODE" == "json" ]]; then
                 PRIV_TEXT_JSON=$PRIV_CONTAINER_DISPLAY
@@ -1375,6 +1395,7 @@ while read -r NS; do
                         --argjson automount "$AUTOMOUNT_JSON" \
                         --arg automount_reason "$AUTOMOUNT_REASON_JSON" \
                         --argjson effective "$EFFECTIVE_JSON" \
+                        --argjson escape_chains "$ESCAPE_CHAINS_JSON" \
                         "{
                                 namespace: \$ns,
                                 pod: \$pod,
@@ -1388,6 +1409,7 @@ while read -r NS; do
                                 requested_caps_from_pod: \$requested,
                                 dropped_caps_from_pod: \$dropped,
                                 effective_caps: \$effective,
+                                escape_chains: \$escape_chains,
                                 allowPrivilegeEscalation: \$allow_priv,
                                 hostPID: \$hostPID,
                                 hostNetwork: \$hostNetwork,

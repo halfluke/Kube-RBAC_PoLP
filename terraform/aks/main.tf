@@ -6,6 +6,9 @@
 
 provider "azurerm" {
   features {}
+
+  # "all" registers every RP on first plan (very slow). "core" is enough for this AKS lab.
+  resource_provider_registrations = "core"
 }
 
 resource "azurerm_resource_group" "this" {

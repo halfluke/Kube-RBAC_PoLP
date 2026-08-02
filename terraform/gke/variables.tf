@@ -34,7 +34,7 @@ variable "disk_size_gb" {
 }
 
 variable "deploy_capability_test_workloads" {
-  description = "Create a namespace and Deployments that exercise Vanilla-ContainerCapabilities.sh (caps add/drop, init vs app, automount, runAsNonRoot)."
+  description = "Create a namespace and Deployments that exercise GKE-ContainerCapabilities.sh (caps add/drop, init vs app, automount, runAsNonRoot)."
   type        = bool
   default     = true
 }
@@ -43,6 +43,18 @@ variable "capability_test_namespace" {
   description = "Namespace for capability test pods (PSA enforce=privileged so examples schedule on default GKE admission)."
   type        = string
   default     = "kube-rbac-polp-cap-test"
+}
+
+variable "deploy_rbac_test_fixtures" {
+  description = "Create namespace + Role/RoleBinding for ../../GKE-rbac.sh (pods/exec on a dedicated ServiceAccount)."
+  type        = bool
+  default     = true
+}
+
+variable "rbac_test_namespace" {
+  description = "Namespace for RBAC test RoleBinding (must not collide with capability_test_namespace)."
+  type        = string
+  default     = "kube-rbac-polp-rbac-test"
 }
 
 variable "capability_test_pause_image" {

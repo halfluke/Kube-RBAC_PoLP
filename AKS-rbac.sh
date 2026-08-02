@@ -454,7 +454,7 @@ echo "===== Kubernetes/AKS RBAC Security Audit ====="
 echo "Context: $($K config current-context 2>/dev/null || echo unknown)"
 echo "User: $($K config view --minify -o jsonpath='{.users[0].name}' 2>/dev/null || echo unknown)"
 if [[ $RUN_ALL -eq 0 ]]; then
-  echo "Selected checks: $(IFS=, ; echo "${!RUN[*]}" | tr ' ' ',')"
+  echo "Selected checks: $(printf '%s\n' "${!RUN[@]}" | sort -n | paste -sd, -)"
   if [[ $CRITICAL_ONLY -eq 1 ]]; then echo "(--critical active: running only critical checks)"; fi
 else
   echo "(No --checks specified: running ALL checks)"
@@ -466,6 +466,12 @@ echo " ⚠ Check reported potential issues"
 if [[ $QUIET -eq 0 ]]; then echo " ✔ OK / no issues"; fi
 echo " = Role name = binding name"
 echo " ≠ Role name ≠ binding name"
+echo " [known AKS platform break-glass] = Microsoft/AKS support or admin kubeconfig path (still listed; not suppressed)"
+echo
+echo "Platform break-glass (documented, not filtered):"
+echo "  • ClusterRole/aks-service + User aks-support (AKS support / service path)"
+echo "  • Users clusterAdmin / clusterUser (az aks get-credentials admin/user)"
+echo "  • Optional Check 2: high-privilege Azure RBAC on the managed cluster ARM resource"
 echo
 
 ##############################################
@@ -603,6 +609,47 @@ is_baseline_identity() {
 }
 
 load_identity_baseline
+
+##############################################
+# Known AKS platform break-glass (annotate only — never suppress)
+##############################################
+# ClusterRole aks-service + User aks-support are Microsoft/AKS support paths.
+# Users clusterAdmin / clusterUser come from az aks get-credentials admin/user kubeconfigs.
+platform_breakglass_role_note() {
+  case "$1" in
+    aks-service) printf '%s' " [known AKS platform break-glass]" ;;
+    cluster-admin) printf '%s' " [known Kubernetes break-glass ClusterRole]" ;;
+  esac
+}
+
+platform_breakglass_subject_note() {
+  case "$1" in
+    aks-support|clusterAdmin|clusterUser) printf '%s' " [known AKS platform break-glass]" ;;
+  esac
+}
+
+# Extract bare subject name from "(User) name …" or "User name …" lines.
+extract_subject_name() {
+  local s="$1" n
+  n=$(printf '%s\n' "$s" | sed -nE 's/.*\((User|Group|ServiceAccount)\)[[:space:]]+([^[:space:]]+).*/\2/p')
+  if [[ -n "$n" ]]; then
+    printf '%s' "$n"
+    return
+  fi
+  printf '%s\n' "$s" | awk '{print $2}'
+}
+
+print_rbac_role_finding() {
+  local kind="$1" name="$2" ns="$3" extra="${4:-}"
+  echo " - $kind/$name (ns: $ns)${extra}$(platform_breakglass_role_note "$name")"
+}
+
+print_rbac_subject_finding() {
+  local subj="$1"
+  local name
+  name=$(extract_subject_name "$subj")
+  echo " * ${subj}$(platform_breakglass_subject_note "$name")"
+}
 
 
 ##############################################
@@ -792,7 +839,7 @@ check_permission() {
     return 1
   }
 
-  echo " ⚠ Roles with this permission:"
+  local roles_header_printed=0
   echo "$matches" | sort -u | while IFS=$'\t' read -r kind name ns olm; do
     if [[ "$kind" == "ClusterRole" ]]; then
       if [[ "$olm" != "-" || "$name" == system:* ]] || _clusterrole_is_system_managed_name "$name"; then
@@ -805,26 +852,42 @@ check_permission() {
       if [[ -n "$ns" ]] && is_excluded_ns "$ns"; then continue; fi
     fi
 
-    echo " - $kind/$name (ns: $ns)"
     local subjects filtered_subjects
     subjects=$(get_subjects_for_role "$kind" "$name" "$ns")
+    if [[ "$subjects" != "<no subjects>" ]]; then
+      filtered_subjects=$(echo "$subjects" | while read -r subj; do
+        local subj_ns subj_name
+        subj_ns=$(echo "$subj" | sed -n 's/.*(ns: \(.*\)).*/\1/p')
+        subj_name=$(echo "$subj" | awk '{print $2}')
+        is_excluded_ns "$subj_ns" && continue
+        [[ "$subj_name" == system:* ]] && continue
+        is_baseline_identity "$subj_name" && continue
+        echo "$subj"
+      done)
+    else
+      filtered_subjects=""
+    fi
+
+    if [[ $QUIET -eq 1 ]]; then
+      if [[ "$subjects" == "<no subjects>" || -z "$filtered_subjects" ]]; then
+        continue
+      fi
+    fi
+
+    if [[ $roles_header_printed -eq 0 ]]; then
+      echo " ⚠ Roles with this permission:"
+      roles_header_printed=1
+    fi
+
+    print_rbac_role_finding "$kind" "$name" "$ns"
     if [[ "$subjects" == "<no subjects>" ]]; then
       if [[ $QUIET -eq 0 ]]; then echo " <no subjects>"; fi
       continue
     fi
-    filtered_subjects=$(echo "$subjects" | while read -r subj; do
-      local subj_ns subj_name
-      subj_ns=$(echo "$subj" | sed -n 's/.*(ns: \(.*\)).*/\1/p')
-      subj_name=$(echo "$subj" | awk '{print $2}')
-      is_excluded_ns "$subj_ns" && continue
-      [[ "$subj_name" == system:* ]] && continue
-      is_baseline_identity "$subj_name" && continue
-      echo "$subj"
-    done)
     if [[ -z "$filtered_subjects" ]]; then
       if [[ $QUIET -eq 0 ]]; then echo " ✔ All subjects are in excluded namespaces"; fi
     else
-      echo "$filtered_subjects" | while read -r subj; do echo " * $subj"; done
+      echo "$filtered_subjects" | while read -r subj; do print_rbac_subject_finding "$subj"; done
     fi
   done
   echo
@@ -851,7 +914,10 @@ if should_run 1; then
   if [[ -z "$out" ]]; then
     if [[ $QUIET -eq 0 ]]; then echo " ✔ None found in RBAC bindings"; fi
   else
-    printf "%s\n" "$out" | sed 's/^/ ⚠ /'
+    printf "%s\n" "$out" | while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      echo " ⚠ ${line} [known AKS/Kubernetes platform break-glass]"
+    done
   fi
   echo
 fi
@@ -901,10 +967,10 @@ if should_run 2; then
               or $r == "Azure Kubernetes Service Contributor Role"
               or $r == "Azure Kubernetes Service RBAC Admin"
             )
-          | " • Azure RBAC \($r) -> \($pn // $pid) (\($pt // "unknown"))"
+          | " • Azure RBAC \($r) -> \($pn // $pid) (\($pt // "unknown")) [known AKS platform break-glass / cloud IAM]"
         ' 2>/dev/null || true)
         if [[ -n "$iam_out" ]]; then
-          echo " Azure role assignments on managed cluster (review for least privilege):"
+          echo " Azure role assignments on managed cluster (review for least privilege; tagged as known platform break-glass / cloud IAM):"
           printf '%s\n' "$iam_out"
         elif [[ $QUIET -eq 0 ]]; then
           echo " ✔ No flagged Owner, Contributor, or AKS admin Azure roles at this cluster scope."
@@ -966,7 +1032,7 @@ if should_run 4; then
     binding_olm=$(echo "$line" | awk '{print $NF}')
     if is_excluded_ns "$ns"; then continue; fi
     if [[ "$binding_olm" != "-" ]]; then continue; fi
-    echo " * $line"
+    print_rbac_subject_finding "$line"
     found=1
   done < <(
     $K get clusterrolebinding -o json \
@@ -1129,7 +1195,10 @@ if should_run 15; then
         .binding as $b |
         (.subjects // [])[]? |
         "(\(.kind)) \(.name) (ns: \(.namespace // "-")) via RoleBinding=" + $b
-      ' | sed 's/^/ ⚠ /'
+      ' | while IFS= read -r line; do
+          [[ -z "$line" ]] && continue
+          echo " ⚠ ${line}$(platform_breakglass_subject_note "$(extract_subject_name "$line")")"
+        done
     done
   echo
 
@@ -1148,7 +1217,10 @@ if should_run 15; then
           .binding as $b |
           (.subjects // [])[]? |
           "(\(.kind)) \(.name) (ns: \(.namespace // "-")) via ClusterRoleBinding=" + $b
-        ' | sed 's/^/ ⚠ /'
+        ' | while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            echo " ⚠ ${line}$(platform_breakglass_subject_note "$(extract_subject_name "$line")")"
+          done
       fi
     done
   echo
@@ -1203,7 +1275,7 @@ if should_run 17; then
           fi
           continue
         fi
-        echo " - $kind/$name (ns: $ns) (rule: verbs=$verbs, resources=$resources, apiGroups=$apigroups, nonResourceURLs=$nresurls)"
+        print_rbac_role_finding "$kind" "$name" "$ns" " (rule: verbs=$verbs, resources=$resources, apiGroups=$apigroups, nonResourceURLs=$nresurls)"
         subjects=$(get_subjects_for_role "$kind" "$name" "${ns:-cluster}")
         if [[ "$subjects" == "<no subjects>" ]]; then
           if [[ $QUIET -eq 0 ]]; then echo " <no subjects>"; fi
@@ -1220,7 +1292,7 @@ if should_run 17; then
         if [[ -z "$filtered_subjects" ]]; then
           if [[ $QUIET -eq 0 ]]; then echo " ✔ All subjects are system/operator accounts or in excluded namespaces"; fi
         else
-          echo "$filtered_subjects" | while read -r s; do echo " * $s"; done
+          echo "$filtered_subjects" | while read -r s; do print_rbac_subject_finding "$s"; done
         fi
       done
     echo
@@ -1298,7 +1370,7 @@ if should_run 18; then
     [[ $QUIET -eq 0 ]] && echo " ✔ No roles grant sensitive pod subresource or endpoint access"
     echo
   else
-    echo "  ⚠ Roles granting sensitive subresources or endpoints access:"
+    check16_section_header_printed=0
 
     # Build per-(kind|name|ns)
     declare -A ROLE_KIND ROLE_NAME ROLE_NS ROLE_OLM ROLE_SUBJECTS
@@ -1378,7 +1450,12 @@ if should_run 18; then
         AL=""
       fi
 
-      echo "     - $kind/$name (ns: $ns_pretty) $AL"
+      if [[ $check16_section_header_printed -eq 0 ]]; then
+        echo "  ⚠ Roles granting sensitive subresources or endpoints access:"
+        check16_section_header_printed=1
+      fi
+
+      echo "     - $kind/$name (ns: $ns_pretty) $AL$(platform_breakglass_role_note "$name")"
 
       # Deduplicate subjects; prefer canonical 'via = <roleName>'
       echo "$all_subjs" | awk '
@@ -1390,11 +1467,17 @@ if should_run 18; then
           ns="-"; if (match(line, /\(ns: ([^)]+)\)/, m)) ns=m[1]
           return kd SUBSEP nm SUBSEP ns
         }
+        function bg_note(nm){
+          if (nm=="aks-support" || nm=="clusterAdmin" || nm=="clusterUser")
+            return " [known AKS platform break-glass]"
+          return ""
+        }
         {
           o=$1; line=$2
           key=parse(line)
+          split(line,t," "); snm=t[2]
           iseq=index(line," via = ")>0
-          if(!(key in best) || (iseq==1 && best_eq[key]==0)){ best[key]=line; best_eq[key]=iseq }
+          if(!(key in best) || (iseq==1 && best_eq[key]==0)){ best[key]=line; best_eq[key]=iseq; best_nm[key]=snm }
           if(!(key in orig)){ orig[key]=o }
           else{
             split(orig[key],a,", ")
@@ -1409,7 +1492,7 @@ if should_run 18; then
             t2=keys[i]; keys[i]=keys[j]; keys[j]=t2
           }
           for(i=1;i<=n;i++){
-            k=keys[i]; print "       * ", lines[i], " (from: ", orig[k], ")"
+            k=keys[i]; print "       * ", lines[i], " (from: ", orig[k], ")", bg_note(best_nm[k])
           }
         }'
     done <<<"$sorted_groups"
@@ -1482,7 +1565,7 @@ if should_run 19; then
         continue
       fi
 
-      echo "   ⚠ $crd — Roles granting get/list/watch:"
+      crd_roles_header_printed=0
 
       # 4) Build per-(kind|name|ns)
       declare -A ROLE_KIND ROLE_NAME ROLE_NS ROLE_OLM ROLE_SUBJECTS
@@ -1562,7 +1645,12 @@ if should_run 19; then
           ALLOWLIST_FLAG=""
         fi
 
-        echo "     - $kind/$name (ns: $ns_pretty) $ALLOWLIST_FLAG"
+        if [[ $crd_roles_header_printed -eq 0 ]]; then
+          echo "   ⚠ $crd — Roles granting get/list/watch:"
+          crd_roles_header_printed=1
+        fi
+
+        echo "     - $kind/$name (ns: $ns_pretty) $ALLOWLIST_FLAG$(platform_breakglass_role_note "$name")"
 
         # Deduplicate subjects; prefer canonical variant
         echo "$all_subjs" | awk '
@@ -1574,11 +1662,17 @@ if should_run 19; then
             ns="-"; if (match(line, /\(ns: ([^)]+)\)/, m)) ns=m[1]
             return kd SUBSEP nm SUBSEP ns
           }
+          function bg_note(nm){
+            if (nm=="aks-support" || nm=="clusterAdmin" || nm=="clusterUser")
+              return " [known AKS platform break-glass]"
+            return ""
+          }
           {
             o=$1; line=$2
             key=parse(line)
+            split(line,t," "); snm=t[2]
             iseq=index(line," via = ")>0
-            if(!(key in best) || (iseq==1 && best_eq[key]==0)){ best[key]=line; best_eq[key]=iseq }
+            if(!(key in best) || (iseq==1 && best_eq[key]==0)){ best[key]=line; best_eq[key]=iseq; best_nm[key]=snm }
             if(!(key in origins)){ origins[key]=o }
             else{
               split(origins[key],a,", ")
@@ -1593,7 +1687,7 @@ if should_run 19; then
               t2=keys[i]; keys[i]=keys[j]; keys[j]=t2
             }
             for(i=1;i<=n;i++){
-              k=keys[i]; print "       * ", lines[i], " (from: ", origins[k], ")"
+              k=keys[i]; print "       * ", lines[i], " (from: ", origins[k], ")", bg_note(best_nm[k])
             }
           }'
       done <<<"$sorted_groups"

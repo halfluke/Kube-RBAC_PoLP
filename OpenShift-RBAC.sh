@@ -481,7 +481,7 @@ check_permission() {
                   "system:node" "system:controller" "system:aggregate-to-admin" \
                   "system:aggregate-to-edit" "system:aggregate-to-view")
 
-    echo "  ⚠ Roles with this permission:"
+    local roles_header_printed=0
     echo "$matches" | sort -u | while IFS=$'\t' read -r kind name ns verbs resources apigroups olm; do
 
         # Skip system/operator-managed roles
@@ -495,15 +495,8 @@ check_permission() {
             [[ -n "$ns" ]] && is_excluded_ns "$ns" && continue
         fi
 
-        echo "    - $kind/$name (ns: $ns)"
-
         # Get subjects for this role
         subjects=$(get_subjects_for_role "$kind" "$name" "$ns")
-
-        if [[ "$subjects" == "<no subjects>" ]]; then
-            [[ $QUIET -eq 0 ]] && echo "      <no subjects>"
-            continue
-        fi
 
         # Filter out system/operator subjects
         filtered_subjects=$(echo "$subjects" | while read -r subj; do
@@ -514,6 +507,24 @@ check_permission() {
             is_baseline_identity "$subj_name" && continue
             echo "$subj"
         done)
+
+        if [[ $QUIET -eq 1 ]]; then
+            if [[ "$subjects" == "<no subjects>" || -z "$filtered_subjects" ]]; then
+                continue
+            fi
+        fi
+
+        if [[ $roles_header_printed -eq 0 ]]; then
+            echo "  ⚠ Roles with this permission:"
+            roles_header_printed=1
+        fi
+
+        echo "    - $kind/$name (ns: $ns)"
+
+        if [[ "$subjects" == "<no subjects>" ]]; then
+            [[ $QUIET -eq 0 ]] && echo "      <no subjects>"
+            continue
+        fi
 
         if [[ -z "$filtered_subjects" ]]; then
             [[ $QUIET -eq 0 ]] && echo "      ✔ All subjects are system/operator accounts"

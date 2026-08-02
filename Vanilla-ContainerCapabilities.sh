@@ -48,8 +48,8 @@ fi
 
 echo "Running Kubernetes security audit (PSA + pod-spec capabilities)..."
 echo "[INFO] Pod-spec + PSA labels only (not live admission); no cloud identity column in this script."
-echo "[INFO] Escape-chain detection is a declared-spec heuristic (cap + co-condition), not runtime verification."
-[[ "$ONLY_USER_NS" -eq 1 ]] && echo "Filtering: only non-system namespaces (not openshift-* / kube-*)."
+echo "[INFO] Escape-chain lines use the pod-spec effective-cap estimate and are listed separately from Status severity (not runtime verification)."
+[[ "$ONLY_USER_NS" -eq 1 ]] && echo "Filtering: only non-system namespaces (not openshift-* / kube-system|kube-public|kube-node-lease)."
 echo ""
 
 # -----------------------------
@@ -78,13 +78,17 @@ status_push () {
     STATUS_MSGS+=("$2")
 }
 
-# Escape-chain detection: capability + enabling co-condition => CRITICAL.
-# Uses REQUESTED_CAPS_ARRAY, HOST_NET, SHARE_PROC_NS, HOSTPATH_WRITABLE_PATHS.
+escape_chain_push () {
+    ESCAPE_CHAIN_MSGS+=("$1")
+}
+
+# Escape-chain detection: estimated effective caps + co-conditions (separate from Status severity).
+# Uses EFFECTIVE_POD_ESTIMATE, HOST_NET, SHARE_PROC_NS, HOSTPATH_WRITABLE_PATHS.
 check_escape_chains () {
     local cap path has_sys_admin=0 has_sys_ptrace=0 has_sys_module=0 has_net=0 has_mknod=0
     local cg_hits=() dev_hits=()
 
-    for cap in "${REQUESTED_CAPS_ARRAY[@]}"; do
+    for cap in "${EFFECTIVE_POD_ESTIMATE[@]}"; do
         [[ -z "$cap" ]] && continue
         case "$(printf '%s' "$cap" | tr '[:lower:]' '[:upper:]')" in
             SYS_ADMIN) has_sys_admin=1 ;;
@@ -106,19 +110,19 @@ check_escape_chains () {
     done
 
     if [[ "$has_sys_admin" -eq 1 && ${#cg_hits[@]} -gt 0 ]]; then
-        status_push 5 "CRITICAL: escape chain SYS_ADMIN + writable cgroup hostPath ($(IFS=,; echo "${cg_hits[*]}")) -> release_agent write -> host command execution"
+        escape_chain_push "Escape chain: SYS_ADMIN + writable cgroup hostPath ($(IFS=,; echo "${cg_hits[*]}")) -> release_agent write -> host command execution"
     fi
     if [[ "$has_sys_ptrace" -eq 1 && "$SHARE_PROC_NS" == "true" ]]; then
-        status_push 5 "CRITICAL: escape chain SYS_PTRACE + shareProcessNamespace -> attach to sibling container process -> credential/memory extraction"
+        escape_chain_push "Escape chain: SYS_PTRACE + shareProcessNamespace -> attach to sibling container process -> credential/memory extraction"
     fi
     if [[ "$has_net" -eq 1 && "$HOST_NET" == "true" ]]; then
-        status_push 5 "CRITICAL: escape chain NET_RAW/NET_ADMIN + hostNetwork -> sniff/spoof node network -> reach metadata API"
+        escape_chain_push "Escape chain: NET_RAW/NET_ADMIN + hostNetwork -> sniff/spoof node network -> reach metadata API"
     fi
     if [[ "$has_mknod" -eq 1 && ${#dev_hits[@]} -gt 0 ]]; then
-        status_push 5 "CRITICAL: escape chain MKNOD + writable /dev hostPath ($(IFS=,; echo "${dev_hits[*]}")) -> create host device node -> raw disk read"
+        escape_chain_push "Escape chain: MKNOD + writable /dev hostPath ($(IFS=,; echo "${dev_hits[*]}")) -> create host device node -> raw disk read"
     fi
     if [[ "$has_sys_module" -eq 1 ]]; then
-        status_push 5 "CRITICAL: escape chain SYS_MODULE -> load kernel module -> full host compromise"
+        escape_chain_push "Escape chain: SYS_MODULE -> load kernel module -> full host compromise"
     fi
 }
 
@@ -136,7 +140,7 @@ get_psa_labels() {
     '
 }
 
-[[ "$OUTPUT_MODE" == "csv" ]] && echo "namespace,pod,serviceAccount,privileged_container,status,requested_caps_from_pod,dropped_caps_from_pod,effective_caps_pod_estimate,allowPrivilegeEscalation,hostPID,hostNetwork,hostIPC,runAsNonRoot,runAsUser,runAsGroup,fsGroup,supplementalGroups,volumeTypes,automountServiceAccountToken"
+[[ "$OUTPUT_MODE" == "csv" ]] && echo "namespace,pod,serviceAccount,privileged_container,status,requested_caps_from_pod,dropped_caps_from_pod,effective_caps_pod_estimate,allowPrivilegeEscalation,hostPID,hostNetwork,hostIPC,runAsNonRoot,runAsUser,runAsGroup,fsGroup,supplementalGroups,volumeTypes,automountServiceAccountToken,escape_chains"
 
 JSON_ITEMS=()
 
@@ -146,7 +150,11 @@ while read -r NS; do
     [[ -z "$NS" ]] && continue
 
     IS_SYSTEM_NS=0
-    if [[ "$NS" == openshift-* ]] || [[ "$NS" == kube-* ]]; then IS_SYSTEM_NS=1; fi
+    # Reserved kube names only — not kube-* prefix (lab fixtures use kube-rbac-polp-*).
+    if [[ "$NS" == openshift-* ]] \
+        || [[ "$NS" == "kube-system" || "$NS" == "kube-public" || "$NS" == "kube-node-lease" ]]; then
+        IS_SYSTEM_NS=1
+    fi
     [[ "$ONLY_USER_NS" -eq 1 && "$IS_SYSTEM_NS" -eq 1 ]] && continue
 
     IFS=$'\t' read -r PSA_ENFORCE PSA_AUDIT PSA_WARN < <(get_psa_labels "$NS")
@@ -417,8 +425,13 @@ while read -r NS; do
             EFFECTIVE_POD_ESTIMATE=("${ALL_LINUX_CAPS[@]}")
             EFFECTIVE_CAPS_STR="(pod estimate) all caps if privileged — ${#EFFECTIVE_POD_ESTIMATE[@]} names; see PRIVILEGED_CAPS/BASELINE lists in script"
         elif [[ "$DROP_ALL" -eq 1 ]]; then
-            EFFECTIVE_POD_ESTIMATE=()
-            EFFECTIVE_CAPS_STR="(pod estimate) DROP ALL in pod spec — no capabilities remaining from this estimate"
+            # drop ALL clears baseline; only explicit .capabilities.add remain
+            EFFECTIVE_POD_ESTIMATE=("${REQUESTED_CAPS_ARRAY[@]}")
+            if [[ ${#EFFECTIVE_POD_ESTIMATE[@]} -eq 0 ]]; then
+                EFFECTIVE_CAPS_STR="(pod estimate) DROP ALL in pod spec — no capabilities remaining from this estimate"
+            else
+                EFFECTIVE_CAPS_STR="(pod estimate, not admission-accurate) ${EFFECTIVE_POD_ESTIMATE[*]}"
+            fi
         else
             EFFECTIVE_POD_ESTIMATE=("${BASELINE_CAPS[@]}" "${BASELINE_PRIVILEGED_CAPS[@]}")
             EFFECTIVE_POD_ESTIMATE+=("${REQUESTED_CAPS_ARRAY[@]}")
@@ -439,6 +452,9 @@ while read -r NS; do
             EFFECTIVE_CAPS_STR="(pod estimate, not admission-accurate) ${EFFECTIVE_POD_ESTIMATE[*]}"
         fi
 
+        ESCAPE_CHAIN_MSGS=()
+        check_escape_chains
+
         # Status: worst severity headline + " — also: " for other findings at the same rank only.
         STATUS_RANKS=()
         STATUS_MSGS=()
@@ -455,9 +471,6 @@ while read -r NS; do
             status_push 4 "HIGH: host access enabled ($HOST_FLAG_JOIN)"
         fi
         [[ "$DROP_ALL" -eq 1 && "$PRIV" != "true" ]] && status_push 1 "INFO: capabilities.drop includes ALL (non-privileged pod spec)"
-
-        # Escape chains before generic cap classification so CRITICAL coexists with WARNING/MEDIUM.
-        check_escape_chains
 
         PRIV_REQ_CAPS=()
         NONBASE_REQ_CAPS=()
@@ -508,6 +521,14 @@ while read -r NS; do
         PRIV_DISPLAY=$([[ "$PRIV" == "true" ]] && echo "true" || echo "false")
         ESC_DISPLAY=$([[ "$ESC" == "true" ]] && echo "true" || echo "false")
 
+        if [[ ${#ESCAPE_CHAIN_MSGS[@]} -eq 0 ]]; then
+            ESCAPE_CHAINS_CSV=""
+            ESCAPE_CHAINS_JSON='[]'
+        else
+            ESCAPE_CHAINS_CSV=$(printf '%s; ' "${ESCAPE_CHAIN_MSGS[@]}" | sed 's/; $//')
+            ESCAPE_CHAINS_JSON=$(printf '%s\n' "${ESCAPE_CHAIN_MSGS[@]}" | jq -R . | jq -s .)
+        fi
+
         if [[ "$OUTPUT_MODE" == "text" ]]; then
             echo "  Pod: $POD"
             echo "    serviceAccount: $SA_NAME"
@@ -527,10 +548,14 @@ while read -r NS; do
             echo "    Capabilities (drop): $DROPPED_CAPS_STR"
             echo "    Effective caps: $EFFECTIVE_CAPS_STR"
             echo "    Status: $STATUS"
+            for _ec in "${ESCAPE_CHAIN_MSGS[@]}"; do
+                echo "    $_ec"
+            done
             echo ""
         elif [[ "$OUTPUT_MODE" == "csv" ]]; then
             EFFECTIVE_ESC=${EFFECTIVE_CAPS_STR//\"/\"\"}
-            echo "\"${NS//\"/\"\"}\",\"${POD//\"/\"\"}\",\"${SA_NAME//\"/\"\"}\",\"$PRIV_DISPLAY\",\"${STATUS//\"/\"\"}\",\"${REQUESTED_CAPS_STR//\"/\"\"}\",\"${DROPPED_CAPS_STR//\"/\"\"}\",\"${EFFECTIVE_ESC}\",\"$ESC_DISPLAY\",\"$HOST_PID\",\"$HOST_NET\",\"$HOST_IPC\",\"${RUN_AS_NONROOT_DISPLAY//\"/\"\"}\",\"${RUN_AS_USER//\"/\"\"}\",\"${RUN_AS_GROUP_DISPLAY//\"/\"\"}\",\"$FSGROUP\",\"${SUPP_GROUPS//\"/\"\"}\",\"${VOLUME_TYPES_DISPLAY//\"/\"\"}\",\"${AUTOMOUNT_DISPLAY//\"/\"\"}\""
+            ESCAPE_ESC=${ESCAPE_CHAINS_CSV//\"/\"\"}
+            echo "\"${NS//\"/\"\"}\",\"${POD//\"/\"\"}\",\"${SA_NAME//\"/\"\"}\",\"$PRIV_DISPLAY\",\"${STATUS//\"/\"\"}\",\"${REQUESTED_CAPS_STR//\"/\"\"}\",\"${DROPPED_CAPS_STR//\"/\"\"}\",\"${EFFECTIVE_ESC}\",\"$ESC_DISPLAY\",\"$HOST_PID\",\"$HOST_NET\",\"$HOST_IPC\",\"${RUN_AS_NONROOT_DISPLAY//\"/\"\"}\",\"${RUN_AS_USER//\"/\"\"}\",\"${RUN_AS_GROUP_DISPLAY//\"/\"\"}\",\"$FSGROUP\",\"${SUPP_GROUPS//\"/\"\"}\",\"${VOLUME_TYPES_DISPLAY//\"/\"\"}\",\"${AUTOMOUNT_DISPLAY//\"/\"\"}\",\"${ESCAPE_ESC}\""
         elif [[ "$OUTPUT_MODE" == "json" ]]; then
             if [[ ${#EFFECTIVE_POD_ESTIMATE[@]} -eq 0 ]]; then
                 EFFECTIVE_JSON='[]'
@@ -561,6 +586,7 @@ while read -r NS; do
                 --arg psa_w "$PSA_WARN" \
                 --arg eff_note "pod spec only, not admission-accurate" \
                 --argjson effective "$EFFECTIVE_JSON" \
+                --argjson escape_chains "$ESCAPE_CHAINS_JSON" \
                 "{
                     namespace: \$ns,
                     pod: \$pod,
@@ -571,6 +597,7 @@ while read -r NS; do
                     dropped_caps_from_pod: \$drop,
                     effective_caps_pod_estimate: \$effective,
                     effective_caps_note: \$eff_note,
+                    escape_chains: \$escape_chains,
                     allowPrivilegeEscalation: (\$esc == \"true\"),
                     hostPID: \$hpid,
                     hostNetwork: \$hnet,

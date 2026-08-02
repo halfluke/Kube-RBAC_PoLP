@@ -2,12 +2,29 @@
 #
 #   cd terraform/gke && cp terraform.tfvars.example terraform.tfvars
 #
-project_id = "your-gcp-project-id"
-# region     = "us-central1"
-# zone       = "us-central1-a"
-# cluster_name = "kube-rbac-polp-gke-test"
-# machine_type = "e2-small"
+# Prerequisites / how to obtain values:
+#   - project_id (REQUIRED): gcloud projects list
+#   - Auth for Terraform: gcloud auth login && gcloud auth application-default login
+#     (or GOOGLE_APPLICATION_CREDENTIALS pointing at a service-account JSON)
+#   - Enable Container / Compute APIs on the project; billing on
+#   - zone/region: gcloud compute zones list --filter="region:us-central1"
 #
-# deploy_capability_test_workloads = false
-# capability_test_namespace        = "kube-rbac-polp-cap-test"
-# capability_test_pause_image      = "registry.k8s.io/pause:3.9"
+# After apply, full GKE-rbac.sh Check 2 needs:
+#   eval "$(terraform output -raw get_credentials)"
+#   export GKE_PROJECT="$(terraform output -raw project_id)"
+#   export GKE_CLUSTER_NAME="$(terraform output -raw cluster_name)"
+#   export GKE_LOCATION="$(terraform output -raw zone)"   # this stack is zonal
+#   ../../GKE-rbac.sh --quiet
+#   ../../GKE-ContainerCapabilities.sh --output text
+# See also: terraform output run_rbac_audit and README "Terraform lab stacks" → GKE.
+
+project_id   = "your-gcp-project-id"
+region       = "us-central1"
+zone         = "us-central1-a"
+cluster_name = "kube-rbac-polp-gke-test"
+machine_type = "e2-small"
+
+deploy_capability_test_workloads = true
+deploy_rbac_test_fixtures        = true
+capability_test_namespace        = "kube-rbac-polp-cap-test"
+capability_test_pause_image      = "registry.k8s.io/pause:3.9"

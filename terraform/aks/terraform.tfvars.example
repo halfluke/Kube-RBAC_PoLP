@@ -2,13 +2,28 @@
 #
 #   cd terraform/aks && cp terraform.tfvars.example terraform.tfvars
 #
-# Azure: az login (or service principal env vars). azurerm 4.x also accepts ARM_SUBSCRIPTION_ID.
+# Prerequisites / how to obtain values:
+#   - Azure login: az login (or ARM_CLIENT_ID / ARM_CLIENT_SECRET / ARM_TENANT_ID /
+#     ARM_SUBSCRIPTION_ID for a service principal). azurerm 4.x also accepts
+#     ARM_SUBSCRIPTION_ID alone when already logged in.
+#   - Active subscription: az account show / az account set --subscription <id>
+#   - Region: az account list-locations -o table (default below: eastus)
 #
-# location              = "eastus"
-# resource_group_name = "kube-rbac-polp-aks-test-rg"
-# cluster_name          = "kube-rbac-polp-aks-test"
-# vm_size               = "Standard_B2s"
-#
-# deploy_capability_test_workloads = false
-# deploy_rbac_test_fixtures        = false
-# capability_test_namespace        = "kube-rbac-polp-cap-test"
+# After apply, full AKS-rbac.sh Check 2 needs:
+#   eval "$(terraform output -raw configure_kubectl)"
+#   export AKS_RESOURCE_GROUP="$(terraform output -raw resource_group_name)"
+#   export AKS_CLUSTER_NAME="$(terraform output -raw cluster_name)"
+#   # optional: export AKS_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+#   ../../AKS-rbac.sh --quiet
+#   ../../AKS-ContainerCapabilities.sh --output text
+# See also: terraform output run_rbac_audit and README "Terraform lab stacks" → AKS.
+
+location            = "eastus"
+resource_group_name = "kube-rbac-polp-aks-test-rg"
+cluster_name        = "kube-rbac-polp-aks-test"
+vm_size             = "Standard_B2s"
+
+# Defaults in variables.tf are already true; set explicitly for a full fixture run:
+deploy_capability_test_workloads = true
+deploy_rbac_test_fixtures        = true
+capability_test_namespace        = "kube-rbac-polp-cap-test"

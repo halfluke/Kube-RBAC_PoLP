@@ -1,18 +1,27 @@
 # Copy to terraform.tfvars and adjust. Do not commit terraform.tfvars.
 #
-# Prerequisites:
-#   - AWS account + credentials (e.g. export AWS_PROFILE=... or access keys)
-#   - AWS CLI v2 on PATH (`aws eks get-token` is used by Terraform's Kubernetes provider)
+# Prerequisites / how to obtain values:
+#   - AWS credentials: aws configure | AWS_PROFILE | access keys
+#   - AWS CLI v2 on PATH (Terraform kubernetes provider uses: aws eks get-token)
 #   - IAM permissions for VPC, EKS, EC2, IAM (OIDC provider + roles), etc.
 #   - Expect NAT gateway + EC2 node charges while the cluster runs (lab stack).
+#   - Region: pick any region your account can use (e.g. aws ec2 describe-regions).
+#
+# After apply, full script run needs kubectl only for Check 2 (aws-auth):
+#   eval "$(terraform output -raw configure_kubectl)"
+#   ../../EKS-rbac.sh --quiet
+#   ../../EKS-ContainerCapabilities.sh --output text
+# See also: terraform output run_rbac_audit / run_container_capabilities_audit
+# and README "Terraform lab stacks" → EKS.
 #
 # EKS-rbac.sh Check 2 reads kube-system/aws-auth. Many EKS clusters still ship this
 # ConfigMap for node auth; clusters that rely only on EKS access entries may not
 # have it — the script reports that case explicitly.
 
-# aws_region   = "us-west-2"
-# cluster_name = "kube-rbac-polp-eks-test"
+aws_region   = "us-west-2"
+cluster_name = "kube-rbac-polp-eks-test"
 
-# deploy_capability_test_workloads = true
-# deploy_rbac_test_fixtures        = true
-# deploy_irsa_demo                 = true
+# Defaults in variables.tf are already true; set explicitly for a full fixture run:
+deploy_capability_test_workloads = true
+deploy_rbac_test_fixtures        = true
+deploy_irsa_demo                 = true

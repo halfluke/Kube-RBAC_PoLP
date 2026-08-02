@@ -1,5 +1,5 @@
 # Zonal GKE cluster for ../../GKE-rbac.sh (Workload Identity) and optional
-# ../../Vanilla-ContainerCapabilities.sh fixtures (see capability_workloads.tf).
+# ../../GKE-ContainerCapabilities.sh + RBAC fixtures (see capability_workloads.tf, rbac_workloads.tf).
 #
 # Requires: gcloud auth application-default login (or GOOGLE_APPLICATION_CREDENTIALS), billing enabled,
 # IAM such as roles/container.admin + roles/compute.networkAdmin on the project.

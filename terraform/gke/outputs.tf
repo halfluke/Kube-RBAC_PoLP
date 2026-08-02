@@ -35,15 +35,20 @@ output "run_rbac_audit" {
 }
 
 output "capability_test_namespace" {
-  description = "Namespace created for Vanilla-ContainerCapabilities.sh fixtures (empty if deploy_capability_test_workloads is false)."
+  description = "Namespace created for GKE-ContainerCapabilities.sh fixtures (empty if deploy_capability_test_workloads is false)."
   value       = var.deploy_capability_test_workloads ? var.capability_test_namespace : ""
 }
 
+output "rbac_test_namespace" {
+  description = "Namespace for RBAC fixtures (empty if deploy_rbac_test_fixtures is false)."
+  value       = var.deploy_rbac_test_fixtures ? var.rbac_test_namespace : ""
+}
+
 output "run_container_capabilities_audit" {
-  description = "Example command for Vanilla-ContainerCapabilities.sh after kubectl is configured."
+  description = "Example command for GKE-ContainerCapabilities.sh after kubectl is configured."
   value       = <<-EOT
     gcloud container clusters get-credentials ${google_container_cluster.this.name} --zone ${var.zone} --project ${var.project_id}
-    ../../Vanilla-ContainerCapabilities.sh
+    ../../GKE-ContainerCapabilities.sh
   EOT
 }
 

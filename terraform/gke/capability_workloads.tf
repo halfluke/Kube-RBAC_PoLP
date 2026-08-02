@@ -1,5 +1,6 @@
-# Fixtures for ../../Vanilla-ContainerCapabilities.sh: caps add/drop, init vs app,
-# automountServiceAccountToken, runAsNonRoot / allowPrivilegeEscalation.
+# Fixtures for ../../GKE-ContainerCapabilities.sh: caps add/drop, init vs app,
+# automountServiceAccountToken, runAsNonRoot / allowPrivilegeEscalation, and
+# declared-spec escape-chain pairs (NET_* + hostNetwork; MKNOD + writable /dev hostPath).
 # Namespace uses PSA enforce=privileged so pods are not blocked by baseline/restricted admission on GKE.
 
 resource "kubernetes_namespace" "cap_test" {
@@ -194,6 +195,91 @@ resource "kubernetes_deployment" "cap_automount_nonroot" {
             allow_privilege_escalation = false
             run_as_non_root            = true
             run_as_user                = 65534
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [kubernetes_namespace.cap_test]
+}
+
+# Escape-chain fixture: NET_ADMIN + hostNetwork (GKE-ContainerCapabilities check_escape_chains).
+resource "kubernetes_deployment" "cap_escape_net_hostnetwork" {
+  count = var.deploy_capability_test_workloads ? 1 : 0
+
+  metadata {
+    name      = "cap-test-escape-net-hostnetwork"
+    namespace = var.capability_test_namespace
+    labels    = { "app.kubernetes.io/name" = "cap-test-escape-net-hostnetwork" }
+  }
+
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { "app.kubernetes.io/name" = "cap-test-escape-net-hostnetwork" }
+    }
+    template {
+      metadata {
+        labels = { "app.kubernetes.io/name" = "cap-test-escape-net-hostnetwork" }
+      }
+      spec {
+        host_network = true
+        container {
+          name  = "main"
+          image = var.capability_test_pause_image
+          security_context {
+            capabilities {
+              add = ["NET_ADMIN"]
+            }
+          }
+        }
+      }
+    }
+  }
+
+  depends_on = [kubernetes_namespace.cap_test]
+}
+
+# Escape-chain fixture: MKNOD + writable /dev hostPath mount.
+resource "kubernetes_deployment" "cap_escape_mknod_dev_hostpath" {
+  count = var.deploy_capability_test_workloads ? 1 : 0
+
+  metadata {
+    name      = "cap-test-escape-mknod-dev"
+    namespace = var.capability_test_namespace
+    labels    = { "app.kubernetes.io/name" = "cap-test-escape-mknod-dev" }
+  }
+
+  spec {
+    replicas = 1
+    selector {
+      match_labels = { "app.kubernetes.io/name" = "cap-test-escape-mknod-dev" }
+    }
+    template {
+      metadata {
+        labels = { "app.kubernetes.io/name" = "cap-test-escape-mknod-dev" }
+      }
+      spec {
+        volume {
+          name = "dev-host"
+          host_path {
+            path = "/dev"
+            type = "Directory"
+          }
+        }
+        container {
+          name  = "main"
+          image = var.capability_test_pause_image
+          volume_mount {
+            name       = "dev-host"
+            mount_path = "/dev"
+            read_only  = false
+          }
+          security_context {
+            capabilities {
+              add = ["MKNOD"]
+            }
           }
         }
       }
