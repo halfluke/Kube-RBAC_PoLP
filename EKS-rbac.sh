@@ -163,7 +163,7 @@ START_TIME_NS=$(date +%s%N)
 # HIGH-VALUE CHECKS:
 # ------------------
 #   1  → system:masters exposures in RBAC
-#   2  → EKS aws-auth ConfigMap (mapRoles/mapUsers → system:masters); not all AWS/EKS access paths
+#   2  → EKS aws-auth (system:masters) + Access Entries (ClusterAdmin/Admin policies); not full AWS IAM
 #   4  → Non-system users with cluster-admin
 #   6  → pod exec
 #   9  → secrets read (get/list/watch)
@@ -194,8 +194,10 @@ START_TIME_NS=$(date +%s%N)
 # • “from:” shows WHERE bindings were found, not privilege flow.
 # • A role with no subjects is ignored — it exposes nothing.
 # • Allowlisted roles are expected controller noise.
-# • EKS check 2 reads kube-system/aws-auth only for entries mapping to system:masters. It does not cover
-#   every path to cluster admin (e.g. EKS access APIs / AccessEntry, IRSA, node/instance roles, broader IAM).
+# • EKS check 2: (a) kube-system/aws-auth mapRoles/mapUsers → system:masters; (b) optional AWS CLI
+#   Access Entries with AmazonEKSClusterAdminPolicy / AmazonEKSAdminPolicy (or kubernetesGroups system:masters).
+#   Cluster/region from EKS_CLUSTER_NAME + AWS_REGION|EKS_REGION, else parsed from the current kubeconfig
+#   context ARN. Does not cover IRSA, node instance roles, or account-wide IAM.
 #
 #
 # ========================================================================
@@ -344,7 +346,8 @@ Description:
   This script performs a comprehensive RBAC audit of a Kubernetes/EKS
   cluster, including secret/credential CRD exposure, wildcard detection,
   pod exec & sensitive subresources, token minting, cluster-admin misuse,
-  and more. Check 2 scans aws-auth mapRoles/mapUsers for system:masters only—not a full AWS/EKS access audit.
+  and more. Check 2 covers aws-auth → system:masters and (when aws can reach the cluster) EKS Access
+  Entries with ClusterAdmin/Admin policies—not a full AWS/EKS access audit.
   See header comments for full details on semantics.
 EOF
   exit 0
@@ -411,7 +414,7 @@ if [[ $LIST_CHECKS -eq 1 ]]; then
   cat <<'EOF'
 Available checks (use --checks to select, comma-separated, ranges allowed):
   1  : RBAC bindings referencing system:masters (ClusterRoleBindings/RoleBindings)
-  2  : EKS aws-auth mapRoles/mapUsers → system:masters only (not full AWS/EKS admin paths)
+  2  : EKS aws-auth → system:masters + Access Entries ClusterAdmin/Admin (needs aws for Access Entries; not full AWS map)
   3  : System groups do NOT have cluster-admin
   4  : No non-system subjects have cluster-admin
   5  : No custom subjects can create workload resources (pods/deployments/statefulsets)
@@ -452,12 +455,12 @@ echo " ⚠ Check reported potential issues"
 if [[ $QUIET -eq 0 ]]; then echo " ✔ OK / no issues"; fi
 echo " = Role name = binding name"
 echo " ≠ Role name ≠ binding name"
-echo " [known EKS platform break-glass] = IAM→system:masters / cluster-admin path (still listed; not suppressed)"
+echo " [known EKS platform break-glass] = IAM→system:masters / Access Entry ClusterAdmin path (still listed; not suppressed)"
 echo
 echo "Platform break-glass (documented, not filtered):"
-echo "  • Check 2: aws-auth mapRoles/mapUsers → system:masters (IAM bridge to cluster-admin)"
+echo "  • Check 2: aws-auth mapRoles/mapUsers → system:masters; Access Entries with AmazonEKSClusterAdminPolicy / AmazonEKSAdminPolicy"
 echo "  • Check 1: Group system:masters bindings; ClusterRole/cluster-admin"
-echo "  • EKS has no AKS-style ClusterRole/aks-service; break-glass is mainly aws-auth + cluster-admin"
+echo "  • EKS has no AKS-style ClusterRole/aks-service; cloud break-glass is aws-auth and/or Access Entries + cluster-admin"
 echo
 
 ##############################################
@@ -592,7 +595,7 @@ load_identity_baseline
 ##############################################
 # Known EKS platform break-glass (annotate only — never suppress)
 ##############################################
-# Primary surface is aws-auth → system:masters (Check 2) and ClusterRole/cluster-admin.
+# Primary surface is aws-auth / Access Entries (Check 2) and ClusterRole/cluster-admin.
 platform_breakglass_role_note() {
   case "$1" in
     cluster-admin) printf '%s' " [known Kubernetes break-glass ClusterRole]" ;;
@@ -880,12 +883,17 @@ if should_run 1; then
   echo
 fi
 
-# Check 2: Scan aws-auth ConfigMap (mapRoles / mapUsers) for mappings to system:masters (cluster-admin via IAM bridge).
-# Does not enumerate all EKS/AWS paths to admin (AccessEntry, IRSA, node roles, etc.).
+# Check 2: (a) aws-auth → system:masters; (b) EKS Access Entries with ClusterAdmin/Admin policies.
+# Does not enumerate IRSA, node instance roles, or account-wide IAM.
 if should_run 2; then
-  echo "2: EKS aws-auth mappings that grant system:masters"
+  echo "2: EKS cloud admin paths (aws-auth + Access Entries)"
   if [[ $QUIET -eq 0 ]]; then
-    echo " (Check 2 scope: kube-system/aws-auth mapRoles/mapUsers only; not full AWS/EKS access picture—see script header.)"
+    echo " (Check 2 scope: aws-auth system:masters + Access Entry ClusterAdmin/Admin policies; not full AWS IAM—see script header.)"
+  fi
+
+  # --- 2a: classic aws-auth ConfigMap ---
+  if [[ $QUIET -eq 0 ]]; then
+    echo " aws-auth (mapRoles/mapUsers → system:masters):"
   fi
   if $K -n kube-system get configmap aws-auth >/dev/null 2>&1; then
     out=$(
@@ -930,8 +938,87 @@ if should_run 2; then
     else
       echo "$out"
     fi
+  elif [[ $QUIET -eq 0 ]]; then
+    echo " (No aws-auth ConfigMap found — common on Access Entry–only clusters)"
+  fi
+
+  # --- 2b: EKS Access Entries (modern admin path) ---
+  if [[ $QUIET -eq 0 ]]; then
+    echo " Access Entries (AmazonEKSClusterAdminPolicy / AmazonEKSAdminPolicy / kubernetesGroups system:masters):"
+  fi
+  eks_cluster="${EKS_CLUSTER_NAME:-}"
+  eks_region="${EKS_REGION:-${AWS_REGION:-${AWS_DEFAULT_REGION:-}}}"
+  if [[ -z "$eks_cluster" || -z "$eks_region" ]]; then
+    _ctx=$($K config current-context 2>/dev/null || true)
+    if [[ "$_ctx" =~ ^arn:aws:eks:([^:]+):[0-9]+:cluster/(.+)$ ]]; then
+      [[ -z "$eks_region" ]] && eks_region="${BASH_REMATCH[1]}"
+      [[ -z "$eks_cluster" ]] && eks_cluster="${BASH_REMATCH[2]}"
+    fi
+  fi
+
+  if ! command -v aws >/dev/null 2>&1; then
+    if [[ $QUIET -eq 0 ]]; then
+      echo " (Access Entries not checked: aws CLI not on PATH)"
+      echo "   Optional: install AWS CLI; cluster/region from kubeconfig ARN or EKS_CLUSTER_NAME + AWS_REGION."
+    fi
+  elif [[ -z "$eks_cluster" || -z "$eks_region" ]]; then
+    if [[ $QUIET -eq 0 ]]; then
+      echo " (Access Entries not checked: could not determine cluster name/region)"
+      echo "   Set EKS_CLUSTER_NAME and AWS_REGION (or EKS_REGION), or use a kubeconfig context"
+      echo "   like arn:aws:eks:<region>:<account>:cluster/<name>."
+    fi
   else
-    echo " (No aws-auth ConfigMap found or not an EKS control-plane context)"
+    ae_json=""
+    if ! ae_json=$(aws eks list-access-entries --cluster-name "$eks_cluster" --region "$eks_region" --output json 2>/dev/null); then
+      ae_json=""
+    fi
+    if [[ -z "$ae_json" ]]; then
+      if [[ $QUIET -eq 0 ]]; then
+        echo " ⚠ Could not list Access Entries via aws eks list-access-entries."
+        echo "   Verify: aws credentials, EKS_CLUSTER_NAME=$eks_cluster, region=$eks_region,"
+        echo "   and permission eks:ListAccessEntries / DescribeAccessEntry / ListAssociatedAccessPolicies."
+      fi
+    else
+      ae_hits=""
+      while IFS= read -r principal; do
+        [[ -z "$principal" ]] && continue
+        entry_json=$(aws eks describe-access-entry \
+          --cluster-name "$eks_cluster" --region "$eks_region" \
+          --principal-arn "$principal" --output json 2>/dev/null || echo '{}')
+        pols_json=$(aws eks list-associated-access-policies \
+          --cluster-name "$eks_cluster" --region "$eks_region" \
+          --principal-arn "$principal" --output json 2>/dev/null || echo '{}')
+        [[ -z "$entry_json" ]] && entry_json='{}'
+        [[ -z "$pols_json" ]] && pols_json='{}'
+        hit_line=$(
+          jq -nr --argjson entry "$entry_json" --argjson pols "$pols_json" --arg p "$principal" '
+            def policy_name: split("/") | last;
+            ($pols.associatedAccessPolicies // []) as $ap
+            | ($ap
+               | map(.policyArn | policy_name)
+               | map(select(. == "AmazonEKSClusterAdminPolicy" or . == "AmazonEKSAdminPolicy"))
+              ) as $admin_pols
+            | ($entry.accessEntry.kubernetesGroups // []) as $groups
+            | ($groups | map(select(. == "system:masters"))) as $master_groups
+            | if ($admin_pols | length) > 0 then
+                " ⚠ Access Entry \($p) -> policies=\($admin_pols | join(",")) [known EKS platform break-glass / Access Entry]"
+              elif ($master_groups | length) > 0 then
+                " ⚠ Access Entry \($p) -> kubernetesGroups=system:masters [known EKS platform break-glass / Access Entry]"
+              else empty
+              end
+          ' 2>/dev/null || true
+        )
+        if [[ -n "$hit_line" ]]; then
+          ae_hits+="${hit_line}"$'\n'
+        fi
+      done < <(echo "$ae_json" | jq -r '.accessEntries[]?' 2>/dev/null)
+
+      if [[ -n "$ae_hits" ]]; then
+        printf '%s' "$ae_hits"
+      elif [[ $QUIET -eq 0 ]]; then
+        echo " ✔ No Access Entries with AmazonEKSClusterAdminPolicy, AmazonEKSAdminPolicy, or kubernetesGroups system:masters."
+      fi
+    fi
   fi
   echo
 fi
@@ -958,7 +1045,7 @@ if should_run 3; then
       if [[ $QUIET -eq 0 ]]; then echo "  ✔ OK"; fi
     else
       echo "  ⚠ VIOLATION: $group has cluster-admin:"
-      echo "$hits" | sed 's/^/   - /'
+      echo "   - ${hits//$'\n'/$'\n'   - }"
     fi
   }
   for grp in system:authenticated system:unauthenticated system:anonymous system:serviceaccounts; do
@@ -1139,8 +1226,8 @@ if should_run 15; then
       echo "$json" | jq -r '
         .binding as $b |
         (.subjects // [])[]? |
-        "(\(.kind)) \(.name) (ns: \(.namespace // "-")) via RoleBinding=" + $b
-      ' | sed 's/^/ ⚠ /'
+        " ⚠ (\(.kind)) \(.name) (ns: \(.namespace // "-")) via RoleBinding=" + $b
+      '
     done
   echo
 
@@ -1158,8 +1245,8 @@ if should_run 15; then
         echo "$json" | jq -r '
           .binding as $b |
           (.subjects // [])[]? |
-          "(\(.kind)) \(.name) (ns: \(.namespace // "-")) via ClusterRoleBinding=" + $b
-        ' | sed 's/^/ ⚠ /'
+          " ⚠ (\(.kind)) \(.name) (ns: \(.namespace // "-")) via ClusterRoleBinding=" + $b
+        '
       fi
     done
   echo
@@ -1464,7 +1551,7 @@ if should_run 19; then
     echo
   else
     echo " Potentially sensitive CRDs:"
-    echo "$SUS_CRDS" | sed 's/^/   - /'
+    echo "   - ${SUS_CRDS//$'\n'/$'\n'   - }"
     echo
 
     # 2) Always enumerate RBAC readers (flag removed)
@@ -1731,14 +1818,14 @@ if should_run 20; then
       printf '%s\n' "$subjects_json" \
       | jq -r --arg ref "$name" '
           .[] |
-          "(\\(.kind)) \\(.name) (ns: \\(.namespace // "-")) via ClusterRoleBinding=" + $ref
-        ' | sed 's/^/ ⚠ /'
+          " ⚠ (\\(.kind)) \\(.name) (ns: \\(.namespace // "-")) via ClusterRoleBinding=" + $ref
+        '
     else
       printf '%s\n' "$subjects_json" \
       | jq -r --arg ref "$name" '
           .[] |
-          "(\\(.kind)) \\(.name) (ns: \\(.namespace // "-")) via RoleBinding=" + $ref
-        ' | sed 's/^/ ⚠ /'
+          " ⚠ (\\(.kind)) \\(.name) (ns: \\(.namespace // "-")) via RoleBinding=" + $ref
+        '
     fi
   }
 

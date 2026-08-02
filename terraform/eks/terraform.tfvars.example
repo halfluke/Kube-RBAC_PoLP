@@ -7,19 +7,23 @@
 #   - Expect NAT gateway + EC2 node charges while the cluster runs (lab stack).
 #   - Region: pick any region your account can use (e.g. aws ec2 describe-regions).
 #
-# After apply, full script run needs kubectl only for Check 2 (aws-auth):
+# After apply:
 #   eval "$(terraform output -raw configure_kubectl)"
 #   ../../EKS-rbac.sh --quiet
 #   ../../EKS-ContainerCapabilities.sh --output text
 # See also: terraform output run_rbac_audit / run_container_capabilities_audit
 # and README "Terraform lab stacks" → EKS.
 #
-# EKS-rbac.sh Check 2 reads kube-system/aws-auth. Many EKS clusters still ship this
-# ConfigMap for node auth; clusters that rely only on EKS access entries may not
-# have it — the script reports that case explicitly.
+# EKS-rbac.sh Check 2: aws-auth → system:masters (kubectl) and Access Entries with
+# AmazonEKSClusterAdminPolicy / AmazonEKSAdminPolicy (aws CLI; cluster/region from
+# kubeconfig ARN or EKS_CLUSTER_NAME + AWS_REGION).
 
-aws_region   = "us-west-2"
+aws_region   = "eu-west-2"
 cluster_name = "kube-rbac-polp-eks-test"
+
+# Prefer t3.medium (or larger): t3.small only fits ~11 pods and cannot schedule
+# all capability fixtures + the IRSA demo on a single node.
+node_instance_type = "t3.medium"
 
 # Defaults in variables.tf are already true; set explicitly for a full fixture run:
 deploy_capability_test_workloads = true

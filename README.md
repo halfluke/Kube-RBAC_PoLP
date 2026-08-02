@@ -4,7 +4,7 @@ Shell scripts that audit **Kubernetes RBAC** and **workload security** (PSA labe
 
 **Use for labs and learning only** — not a replacement for cloud IAM reviews, admission controllers, or org policy.
 
-**Testing status:** Heavily used on **local Kubernetes** and **OpenShift** (older tree). **AKS** and **GKE** scripts and their Terraform lab stacks have been validated end-to-end (apply → audits → destroy). **EKS** paths and Terraform are newer; treat those runs as best-effort until you validate on your account.
+**Testing status:** Heavily used on **local Kubernetes** and **OpenShift** (older tree). **AKS**, **GKE**, and **EKS** scripts and their Terraform lab stacks have been validated end-to-end (apply → audits → destroy).
 
 ---
 
@@ -141,7 +141,8 @@ export AKS_CLUSTER_NAME="$(terraform output -raw cluster_name)"
 # export GKE_PROJECT="$(terraform output -raw project_id)"
 # export GKE_CLUSTER_NAME="$(terraform output -raw cluster_name)"
 # export GKE_LOCATION="$(terraform output -raw zone)"
-# EKS: no extra exports — Check 2 uses kubectl + aws-auth
+# EKS: Check 2 uses kubectl aws-auth + aws Access Entries (cluster/region from kubeconfig ARN,
+# or export EKS_CLUSTER_NAME / AWS_REGION)
 
 # 3) Audits (from repo root)
 cd ../..
@@ -197,6 +198,8 @@ kubectl get ns
 
 **Capabilities scripts** answer: *how risky are pods on paper?* (privileged, caps, host namespaces, PSA labels). They read **declared spec**, not live enforcement. **Escape chains** (e.g. caps + `hostNetwork`) print as separate `Escape chain:` lines — they do **not** change the main `Status` severity.
 
+On **EKS / GKE / AKS**, known managed-plane pods (`aws-node` / `kube-proxy`, GKE `netd`, AKS CNI, etc.) still report `CRITICAL`/`HIGH` when the spec warrants it, but Status and escape-chain lines are tagged `[known … platform component — expected on managed nodes]` (annotate, do not hide). Other findings in system namespaces get a milder `[platform namespace workload …]` tag. Use `--only-user-ns` to focus on app/lab namespaces.
+
 ### Commands beginners use most
 
 ```bash
@@ -216,7 +219,7 @@ Same flags work on `EKS-rbac.sh`, `GKE-rbac.sh`, `AKS-rbac.sh`, `OpenShift-RBAC.
 
 | Cloud | Extra env before RBAC script |
 |-------|------------------------------|
-| EKS | *(none)* — uses `kube-system/aws-auth` via kubectl |
+| EKS | *(usually none)* — `aws-auth` via kubectl; Access Entries via `aws` (cluster/region from kubeconfig ARN or `EKS_CLUSTER_NAME` + `AWS_REGION`) |
 | GKE | `GKE_PROJECT` (project IAM; cluster name/location not required for Check 2) |
 | AKS | `AKS_RESOURCE_GROUP`, `AKS_CLUSTER_NAME` |
 
@@ -323,7 +326,12 @@ export GKE_PROJECT="$(terraform output -raw project_id)"
 
 Also install **`gke-gcloud-auth-plugin`** (`sudo apt install google-cloud-cli-gke-gcloud-auth-plugin` when gcloud is from apt) so Terraform’s Kubernetes provider and kubectl can authenticate to GKE.
 
-**EKS** Check 2 needs no extra exports — only a working kubectl context.
+**EKS** Check 2: `aws-auth` needs only kubectl. Access Entries need the AWS CLI (same creds as the cluster); cluster/region are taken from the kubeconfig context ARN when possible, else:
+
+```bash
+export EKS_CLUSTER_NAME="$(terraform output -raw cluster_name)"
+export AWS_REGION="$(terraform output -raw aws_region)"
+```
 
 ### Audit runs but cap/RBAC test namespaces look empty
 
@@ -347,7 +355,7 @@ Note the **exact command**, **cloud + region from `terraform.tfvars`**, and the 
 
 Not a full cloud IAM audit — only a **small, documented slice**:
 
-- **EKS:** `aws-auth` / `system:masters` mappings  
+- **EKS:** `aws-auth` → `system:masters`, plus Access Entries with `AmazonEKSClusterAdminPolicy` / `AmazonEKSAdminPolicy`  
 - **GKE:** project IAM (`Owner` / `Editor` / `container.clusterAdmin` / `container.admin` on the GCP project; GKE has no cluster-resource `get-iam-policy`)
 - **AKS:** Azure role assignments on the AKS cluster resource
 
@@ -358,7 +366,7 @@ Cloud RBAC scripts **do not hide** vendor break-glass paths. They **tag** them s
 | Cloud | Tagged in output |
 |-------|------------------|
 | **AKS** | `ClusterRole/aks-service`, Users `aks-support` / `clusterAdmin` / `clusterUser`; Check 2 Azure RBAC hits; `cluster-admin` |
-| **EKS** | Check 2 `aws-auth` → `system:masters`; Check 1 `system:masters` bindings; `cluster-admin` (no AKS-style `aks-service` role) |
+| **EKS** | Check 2 `aws-auth` → `system:masters` and/or Access Entry `AmazonEKSClusterAdminPolicy`; Check 1 `system:masters`; `cluster-admin` (no AKS-style `aks-service` role) |
 | **GKE** | Check 2 GCP project `Owner` / `Editor` / `container.clusterAdmin` / `container.admin`; Check 1 `system:masters`; `cluster-admin` |
 
 Look for the suffix `[known … platform break-glass]` (or `[known Kubernetes break-glass ClusterRole]`). These remain listed on purpose.

@@ -56,6 +56,7 @@ fi
 echo "Running AKS security audit (PSA + pod-spec capabilities)..."
 echo "[INFO] Pod-spec + PSA labels only (not live admission); Workload Identity column is an in-cluster hint, not full Azure IAM."
 echo "[INFO] Escape-chain lines use the pod-spec effective-cap estimate and are listed separately from Status severity (not runtime verification)."
+echo "[INFO] Known managed-plane pods (e.g. kube-proxy, azure-cni, cloud-node-manager) keep their severity but are tagged [known AKS platform component] — not suppressed."
 [[ "$ONLY_USER_NS" -eq 1 ]] && echo "Filtering: only non-system namespaces (not openshift-* / kube-system|kube-public|kube-node-lease / gmp-* / calico-* / tigera-* / aks-command / azure-arc* / app-routing-system / ingress-appgw / kube-lineage / config-management-system / gatekeeper-system)."
 echo ""
 
@@ -87,6 +88,28 @@ escape_chain_push () {
 status_push () {
     STATUS_RANKS+=("$1")
     STATUS_MSGS+=("$2")
+}
+
+# Annotate known managed-plane workloads (CNI/proxy/node-manager). Never suppresses severity.
+platform_workload_note () {
+    local ns="$1" pod="$2" sa="$3"
+    local note=""
+    case "$sa" in
+        kube-proxy|azure-cni|cloud-node-manager|csi-azuredisk-node-sa|csi-azurefile-node-sa|konnectivity-agent|azure-ip-masq-agent)
+            note=" [known AKS platform component — expected on managed nodes]"
+            ;;
+    esac
+    if [[ -z "$note" ]]; then
+        case "$pod" in
+            kube-proxy-*|azure-cni-*|cloud-node-manager-*|csi-azuredisk-node-*|csi-azurefile-node-*|konnectivity-agent-*|azure-ip-masq-agent-*)
+                note=" [known AKS platform component — expected on managed nodes]"
+                ;;
+        esac
+    fi
+    if [[ -z "$note" ]] && { [[ "$ns" == "kube-system" || "$ns" == "kube-public" || "$ns" == "kube-node-lease" ]] || [[ "${IS_SYSTEM_NS:-0}" -eq 1 ]]; }; then
+        note=" [platform namespace workload — vendor baseline unless unexpected]"
+    fi
+    printf '%s' "$note"
 }
 
 # Escape-chain detection: estimated effective caps + co-conditions (separate from Status severity).
@@ -541,6 +564,14 @@ while read -r NS; do
 
         if [[ "$PSA_ENFORCE" == "restricted" && "$FINDING_COUNT" -gt 0 ]]; then
             STATUS="$STATUS (violates restricted PSA enforce profile)"
+        fi
+
+        PLATFORM_NOTE=$(platform_workload_note "$NS" "$POD" "$SA_NAME")
+        if [[ -n "$PLATFORM_NOTE" && "$STATUS" != "OK" ]]; then
+            STATUS="${STATUS}${PLATFORM_NOTE}"
+            for _i in "${!ESCAPE_CHAIN_MSGS[@]}"; do
+                ESCAPE_CHAIN_MSGS[_i]="${ESCAPE_CHAIN_MSGS[_i]}${PLATFORM_NOTE}"
+            done
         fi
 
         [[ "$DEBUG" -eq 1 ]] && echo "DEBUG pod=$NS/$POD PRIV=$PRIV DROP_ALL=$DROP_ALL FINDINGS=$FINDING_COUNT STATUS=$STATUS"

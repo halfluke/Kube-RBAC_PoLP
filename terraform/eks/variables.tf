@@ -29,9 +29,9 @@ variable "vpc_cidr" {
 }
 
 variable "node_instance_type" {
-  description = "Instance type for the single managed node group."
+  description = "Instance type for the single managed node group. t3.small (~11 pods) is too small for all capability + IRSA fixtures; t3.medium is the lab default."
   type        = string
-  default     = "t3.small"
+  default     = "t3.medium"
 }
 
 variable "node_disk_size" {
