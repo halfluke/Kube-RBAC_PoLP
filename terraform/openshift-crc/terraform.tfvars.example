@@ -1,0 +1,17 @@
+# Copy to terraform.tfvars and adjust if needed.
+# Prerequisites:
+#   1. crc start (on Windows Hyper-V host)
+#   2. oc login as kubeadmin (cluster-admin) — developer is not enough for SCC bindings
+#      oc login https://api.crc.testing:6443 -u kubeadmin -p '<password>' --insecure-skip-tls-verify
+#   3. From Kali/WSL, ensure API reachability (see README: OpenShift CRC from Kali WSL)
+
+kubeconfig_path = "~/.kube/config"
+# kube_context  = ""   # leave empty for current-context after oc login
+
+deploy_rbac_test_fixtures        = true
+deploy_capability_test_workloads = true
+
+# rbac_test_namespace        = "kube-rbac-polp-crc-rbac-test"
+# capability_test_namespace  = "kube-rbac-polp-crc-cap-test"
+# capability_test_pause_image            = "registry.k8s.io/pause:3.9"
+# capability_test_init_container_image   = "docker.io/library/busybox:1.36"

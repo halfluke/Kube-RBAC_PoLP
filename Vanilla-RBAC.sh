@@ -742,16 +742,24 @@ if [[ -z "$wild_rules" ]]; then
     [[ $QUIET -eq 0 ]] && echo "  ✔ No critical wildcard usage detected."
     echo
 else
-    echo "$wild_rules" \
-    | awk -F'\t' '!seen[$2,$3,$4,$5,$6,$7]++' \
-    | while IFS=$'\t' read -r kind name ns verbs resources apigroups nresurls olm; do
+    # Known system clusterroles to skip (same set as check_permission)
+    SYSTEM_ROLES=("admin" "edit" "view" "cluster-admin" "basic-user" "self-provisioner" \
+                  "cluster-reader" "system:discovery" "system:heapster" \
+                  "system:node" "system:controller" "system:aggregate-to-admin" \
+                  "system:aggregate-to-edit" "system:aggregate-to-view")
 
-        if [[ "$kind" == "ClusterRole" && ( "$olm" != "-" || "$name" == system:* ) ]]; then
-            [[ $QUIET -eq 0 ]] && echo "    - $kind/$name (ns: $ns) -> <skipped system/operator-managed>"
-            continue
+    # Process substitution (not a pipe) so set -e/pipefail cannot abort the script when
+    # the last loop body ends with a failing quiet-mode [[ ... ]] && echo.
+    while IFS=$'\t' read -r kind name ns verbs resources apigroups nresurls olm; do
+
+        if [[ "$kind" == "ClusterRole" ]]; then
+            if [[ "$olm" != "-" ]] || [[ "$name" == system:* ]] || [[ " ${SYSTEM_ROLES[*]} " =~ $name ]]; then
+                [[ $QUIET -eq 0 ]] && echo "    - $kind/$name (ns: $ns) -> <skipped system/operator-managed>"
+                continue
+            fi
+        else
+            [[ -n "$ns" ]] && is_excluded_ns "$ns" && continue
         fi
-
-        echo "    - $kind/$name (ns: $ns) (rule: verbs=$verbs, resources=$resources, apiGroups=$apigroups, nonResourceURLs=$nresurls)"
 
         # Determine correct scope for fetching bindings
         if [[ "$ns" == "cluster" ]]; then
@@ -761,7 +769,10 @@ else
         fi
 
         if [[ "$subjects" == "<no subjects>" ]]; then
-            [[ $QUIET -eq 0 ]] && echo "      <no subjects>"
+            if [[ $QUIET -eq 0 ]]; then
+                echo "    - $kind/$name (ns: $ns) (rule: verbs=$verbs, resources=$resources, apiGroups=$apigroups, nonResourceURLs=$nresurls)"
+                echo "      <no subjects>"
+            fi
             continue
         fi
 
@@ -775,13 +786,18 @@ else
         done)
 
         if [[ -z "$filtered_subjects" ]]; then
-            [[ $QUIET -eq 0 ]] && echo "      ✔ All subjects are system/operator accounts"
-        else
-            echo "$filtered_subjects" | while read -r subj; do
-                echo "      * $subj"
-            done
+            if [[ $QUIET -eq 0 ]]; then
+                echo "    - $kind/$name (ns: $ns) (rule: verbs=$verbs, resources=$resources, apiGroups=$apigroups, nonResourceURLs=$nresurls)"
+                echo "      ✔ All subjects are system/operator accounts"
+            fi
+            continue
         fi
-    done
+
+        echo "    - $kind/$name (ns: $ns) (rule: verbs=$verbs, resources=$resources, apiGroups=$apigroups, nonResourceURLs=$nresurls)"
+        echo "$filtered_subjects" | while read -r subj; do
+            echo "      * $subj"
+        done
+    done < <(echo "$wild_rules" | awk -F'\t' '!seen[$2,$3,$4,$5,$6,$7]++')
     echo
 fi
 fi

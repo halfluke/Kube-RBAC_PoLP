@@ -15,6 +15,7 @@ Shell scripts that audit **Kubernetes RBAC** and **workload security** (PSA labe
 | **kubectl already works** (`kubectl get ns` OK) | [Run the audits](#run-the-audits) with **Vanilla-*** scripts (or cloud-named scripts if the cluster is on that cloud). |
 | **No cluster — want Azure / AWS / GCP lab** | [Deploy with Terraform](#deploy-a-cloud-lab-with-terraform), then [run the audits](#run-the-audits). |
 | **Kind / minikube / home cluster, need test pods only** | `terraform/local-vanilla/` applies fixtures to your kubeconfig (no new cluster). |
+| **OpenShift CRC already running, need test fixtures** | `terraform/openshift-crc/` applies RBAC + capability fixtures (SCC grants included); then run OpenShift scripts. |
 
 ---
 
@@ -31,7 +32,7 @@ Shell scripts that audit **Kubernetes RBAC** and **workload security** (PSA labe
 
 **Cluster access:** Your kubeconfig must be able to list namespaces and read RBAC + pods. Scripts stop early if `kubectl get ns` fails.
 
-**OpenShift:** use `oc` instead of `kubectl`; `OpenShift-ContainerCapabilities.sh` needs `./jq-linux-amd64` in the repo root.
+**OpenShift:** use `oc` instead of `kubectl`; `OpenShift-ContainerCapabilities.sh` needs `./jq-linux-amd64` in the repo root. If CRC runs on Windows Hyper-V and you use Kali in WSL2, see [OpenShift CRC from Kali WSL](#openshift-crc-from-kali-wsl-windows-hyper-v).
 
 ---
 
@@ -162,6 +163,20 @@ cd ../..
 ./Vanilla-ContainerCapabilities.sh --output text
 ```
 
+**OpenShift CRC fixtures** (cluster already running; apply as **kubeadmin** — developer is not enough for SCC bindings). From Kali/WSL, API reachability must work first — see [OpenShift CRC from Kali WSL](#openshift-crc-from-kali-wsl-windows-hyper-v).
+
+```bash
+# Password from Windows: crc console --credentials
+oc login https://api.crc.testing:6443 -u kubeadmin -p '<password>' --insecure-skip-tls-verify
+
+cd terraform/openshift-crc
+cp terraform.tfvars.example terraform.tfvars   # optional
+terraform init && terraform apply
+cd ../..
+./OpenShift-RBAC.sh --quiet
+./OpenShift-ContainerCapabilities.sh --only-user-ns --output text
+```
+
 ### Terraform stacks at a glance
 
 | Directory | Creates cluster? | Scripts to run after |
@@ -170,6 +185,7 @@ cd ../..
 | `terraform/eks/` | Yes (EKS + VPC) | `EKS-rbac.sh`, `EKS-ContainerCapabilities.sh` |
 | `terraform/gke/` | Yes (GKE) | `GKE-rbac.sh`, `GKE-ContainerCapabilities.sh` |
 | `terraform/local-vanilla/` | No | `Vanilla-RBAC.sh`, `Vanilla-ContainerCapabilities.sh` |
+| `terraform/openshift-crc/` | No (existing CRC) | `OpenShift-RBAC.sh`, `OpenShift-ContainerCapabilities.sh` |
 
 Useful outputs (all clouds): `configure_kubectl` or `get_credentials`, `capability_test_namespace`, `rbac_test_namespace`, `run_rbac_audit`, `run_container_capabilities_audit`.
 
@@ -307,6 +323,56 @@ Microsoft’s `InstallAzureCLIDeb` script does not recognize `kali-rolling`. Opt
 - **Recommended on Kali:** `sudo apt update && sudo apt install -y azure-cli`
 - Or: `curl -sL https://aka.ms/InstallAzureCLIDeb | sudo DIST_CODE=bookworm bash`
 - **`SyntaxWarning`** spam from `python3-azext-devops` during install is harmless; `az version` should still work.
+
+### OpenShift CRC from Kali WSL (Windows Hyper-V)
+
+**Symptom:** `oc login https://api.crc.testing:6443` works from **Windows PowerShell**, but from **Kali WSL** you get:
+
+```text
+error: dial tcp 127.0.0.1:6443: connect: connection refused
+```
+
+**Why `/etc/hosts` alone is not enough**
+
+CRC adds `api.crc.testing` → `127.0.0.1` in the Windows hosts file, and the API listens **only** on Windows localhost (`127.0.0.1:6443`), not on `0.0.0.0` or the WSL virtual adapter.
+
+In WSL2, `127.0.0.1` is the Linux VM itself — not Windows — so that mapping always fails from Kali.
+
+Pointing Kali’s `/etc/hosts` at the Windows side of the WSL link (often `172.x.x.1` from `grep nameserver /etc/resolv.conf`) only fixes **name resolution**. The TCP connect still targets that `172.x` address on Windows, where **nothing is listening** on port 6443 (CRC is bound to `127.0.0.1` only). You still get connection refused until something forwards `172.x:6443` → `127.0.0.1:6443`.
+
+**Fix on Windows 10 (port proxy)** — run in **Admin PowerShell**. Replace `172.17.112.1` with your current WSL gateway if different:
+
+```powershell
+$gw = (Get-NetIPAddress -AddressFamily IPv4 |
+  Where-Object { $_.InterfaceAlias -eq 'vEthernet (WSL)' }).IPAddress
+
+netsh interface portproxy add v4tov4 listenaddress=$gw listenport=6443 connectaddress=127.0.0.1 connectport=6443
+netsh interface portproxy add v4tov4 listenaddress=$gw listenport=443  connectaddress=127.0.0.1 connectport=443
+netsh interface portproxy add v4tov4 listenaddress=$gw listenport=80   connectaddress=127.0.0.1 connectport=80
+
+New-NetFirewallRule -DisplayName 'CRC from WSL' -Direction Inbound -Protocol TCP -LocalPort 80,443,6443 -Action Allow
+```
+
+Then on Kali, map CRC names to that same gateway IP (not `127.0.0.1`):
+
+```bash
+GW=$(grep -m1 nameserver /etc/resolv.conf | awk '{print $2}')
+# If a CRC line already exists, change its IP; otherwise append one:
+sudo sed -i -E "s/^[0-9.]+[[:space:]]+(api\.crc\.testing)/${GW}\t\1/" /etc/hosts
+# Or edit /etc/hosts so the CRC hostnames use $GW
+```
+
+Login:
+
+```bash
+oc login https://api.crc.testing:6443 -u developer -p developer --insecure-skip-tls-verify
+# Admin (password from: crc console --credentials on Windows):
+# oc login https://api.crc.testing:6443 -u kubeadmin -p '<password>' --insecure-skip-tls-verify
+```
+
+**After reboot:** the WSL gateway IP can change. Re-run the `portproxy` commands with the new `$gw`, and update Kali `/etc/hosts` to match.
+
+**Windows 11 alternative:** WSL mirrored networking (`networkingMode=mirrored` in `%UserProfile%\.wslconfig`, then `wsl --shutdown`) shares localhost with Windows so CRC’s `127.0.0.1` mapping works as-is. That mode is **not** available on Windows 10 (e.g. build 19045); use the port-proxy path above.
 
 ### RBAC Check 2 missing or “skipped” (GKE / AKS)
 

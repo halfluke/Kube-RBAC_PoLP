@@ -1,14 +1,13 @@
 #!/bin/bash
 
-echo "Performing SCC + capabilities check (./jq-linux-amd64-only, '*' expanded)..."
-echo "[INFO] Escape-chain lines use the pod-spec effective-cap estimate and are listed separately from Status severity (not runtime verification)."
-
 # -----------------------------
 # Flags / argument parsing
 # -----------------------------
 ONLY_USER_NS=0
 OUTPUT_MODE="text"   # text | csv | json
-DEBUG=1              # set to 1 to enable step-by-step debug output
+DEBUG=0
+ARO_MODE=0
+ROSA_MODE=0
 # SCC candidate ranking when annotation is missing (after subject-review fails):
 #   v1 — privileged + host namespaces only (scc_satisfies_pod)
 #   v2 — v1 plus runAs*/fsGroup/supplementalGroups + allowed volumes (scc_satisfies_pod_enhanced)
@@ -18,22 +17,82 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --only-user-ns) ONLY_USER_NS=1; shift ;;
     --output) OUTPUT_MODE="$2"; shift 2 ;;
+    --debug) DEBUG=1; shift ;;
+    --aro) ARO_MODE=1; shift ;;
+    --rosa) ROSA_MODE=1; shift ;;
     --scc-matching)
       SCC_MATCHING_VERSION="$2"
       shift 2
       ;;
-    *) echo "[ERROR] Unknown argument: $1"; exit 1 ;;
+    -h|--help)
+      cat <<'EOF'
+OpenShift Container Capabilities / SCC audit
+
+Usage:
+  OpenShift-ContainerCapabilities.sh [--only-user-ns] [--output text|csv|json]
+                                     [--scc-matching v1|v2] [--debug] [--aro|--rosa]
+
+  --aro / --rosa   Surface Azure WI / AWS IRSA-style annotations (mutually exclusive).
+                   Annotation/label read only (no az/aws API calls).
+  --aro keys       azure.workload.identity/client-id
+                   azure.workload.identity/service-account-client-id (SA fallback)
+  --rosa keys      eks.amazonaws.com/role-arn ; iam.amazonaws.com/role
+                   (pod annotation first, then SA fallback)
+EOF
+      exit 0
+      ;;
+    *) echo "[ERROR] Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
 
+if [[ $ARO_MODE -eq 1 && $ROSA_MODE -eq 1 ]]; then
+  echo "[ERROR] --aro and --rosa are mutually exclusive" >&2
+  exit 1
+fi
+
 if [[ "$OUTPUT_MODE" != "text" && "$OUTPUT_MODE" != "csv" && "$OUTPUT_MODE" != "json" ]]; then
-  echo "[ERROR] Invalid --output mode. Use: text | csv | json"
+  echo "[ERROR] Invalid --output mode. Use: text | csv | json" >&2
   exit 1
 fi
 
 if [[ "$SCC_MATCHING_VERSION" != "v1" && "$SCC_MATCHING_VERSION" != "v2" ]]; then
-  echo "[ERROR] Invalid --scc-matching \"$SCC_MATCHING_VERSION\". Use: v1 | v2"
+  echo "[ERROR] Invalid --scc-matching \"$SCC_MATCHING_VERSION\". Use: v1 | v2" >&2
   exit 1
+fi
+
+START_TIME_NS=$(date +%s%N)
+
+# Info banners: keep CSV/JSON stdout machine-clean
+info() {
+  if [[ "$OUTPUT_MODE" == "text" ]]; then
+    echo "$@"
+  else
+    echo "$@" >&2
+  fi
+}
+
+info "Performing SCC + capabilities check (oc + jq; '*' expanded)..."
+info "[INFO] Escape-chain lines use the pod-spec effective-cap estimate and are listed separately from Status severity (not runtime verification)."
+if [[ $ARO_MODE -eq 1 ]]; then
+  info "[INFO] --aro: reporting azure.workload.identity/client-id (pod, then SA fallback)."
+elif [[ $ROSA_MODE -eq 1 ]]; then
+  info "[INFO] --rosa: reporting eks.amazonaws.com/role-arn or iam.amazonaws.com/role (pod, then SA fallback)."
+fi
+
+# -----------------------------
+# Requirements check
+# -----------------------------
+if ! command -v oc &> /dev/null; then
+    echo "[ERROR] oc not found." >&2
+    exit 1
+fi
+if ! command -v jq &> /dev/null; then
+    echo "[ERROR] jq not found." >&2
+    exit 1
+fi
+if ! oc get ns >/dev/null 2>&1; then
+    echo "[ERROR] Cannot list namespaces or reach the cluster (oc get namespaces failed). Check kubeconfig and RBAC." >&2
+    exit 1
 fi
 
 # -----------------------------
@@ -45,23 +104,35 @@ BASELINE_CAPS=("FSETID" "FOWNER" "MKNOD" "NET_RAW" "SETGID" "SETUID" "SETFCAP" "
 ALL_LINUX_CAPS=("${BASELINE_CAPS[@]}" "${BASELINE_PRIVILEGED_CAPS[@]}" "${PRIVILEGED_CAPS[@]}")
 
 # Add after capability definitions, before namespace iteration:
-echo "Pre-fetching all SCCs..."
-ALL_SCCS_JSON=$(oc get scc -o json)
-echo "SCC guess matcher (when annotation missing, after subject-review): $SCC_MATCHING_VERSION  [override: --scc-matching v1 | v2]"
-echo "If annotation + subject-review + matcher all fail, SCC is reported as unknown (no priority fallback)."
+info "Pre-fetching all SCCs..."
+if ! ALL_SCCS_JSON=$(oc get scc -o json 2>/dev/null) || [[ -z "$ALL_SCCS_JSON" ]]; then
+  echo "[ERROR] Failed to list SecurityContextConstraints (oc get scc)." >&2
+  exit 1
+fi
+declare -A SCC_BY_NAME ACCESSIBLE_SCC_CACHE SCC_REVIEW_CACHE
+while IFS= read -r _scc_name; do
+  [[ -z "$_scc_name" ]] && continue
+  SCC_BY_NAME["$_scc_name"]=$(echo "$ALL_SCCS_JSON" | jq -c --arg n "$_scc_name" '.items[] | select(.metadata.name==$n)')
+done < <(echo "$ALL_SCCS_JSON" | jq -r '.items[].metadata.name')
+if ! NS_JSON=$(oc get ns -o json 2>/dev/null); then
+  echo "[ERROR] Failed to list namespaces (oc get ns)." >&2
+  exit 1
+fi
+info "SCC guess matcher (when annotation missing, after subject-review): $SCC_MATCHING_VERSION  [override: --scc-matching v1 | v2]"
+info "If annotation + subject-review + matcher all fail, SCC is reported as unknown (no priority fallback)."
 
 # -----------------------------
 # Print capability arrays at start
 # -----------------------------
-echo "-----------------------------"
-echo "Baseline capabilities:"
-echo "  ${BASELINE_CAPS[*]}"
-echo "Baseline privileged capabilities:"
-echo "  ${BASELINE_PRIVILEGED_CAPS[*]}"
-echo "Privileged capabilities:"
-echo "  ${PRIVILEGED_CAPS[*]}"
-echo "-----------------------------"
-echo ""
+info "-----------------------------"
+info "Baseline capabilities:"
+info "  ${BASELINE_CAPS[*]}"
+info "Baseline privileged capabilities:"
+info "  ${BASELINE_PRIVILEGED_CAPS[*]}"
+info "Privileged capabilities:"
+info "  ${PRIVILEGED_CAPS[*]}"
+info "-----------------------------"
+info ""
 
 containsElement () {
   local match="$1"; shift
@@ -131,7 +202,15 @@ check_escape_chains () {
     fi
 }
 
-[[ "$OUTPUT_MODE" == "csv" ]] && echo "namespace,pod,scc,serviceAccount,privileged_container,status,scc_caps,defaultAddCapabilities,requiredDropCapabilities,requested_caps_from_pod,dropped_caps_from_pod,effective_caps,allowPrivilegeEscalation,hostPID,hostNetwork,hostIPC,runAsNonRoot,runAsUser,escape_chains,automountServiceAccountToken"
+if [[ "$OUTPUT_MODE" == "csv" ]]; then
+  if [[ $ARO_MODE -eq 1 ]]; then
+    echo "namespace,pod,scc,serviceAccount,privileged_container,status,scc_caps,defaultAddCapabilities,requiredDropCapabilities,requested_caps_from_pod,dropped_caps_from_pod,effective_caps,allowPrivilegeEscalation,hostPID,hostNetwork,hostIPC,runAsNonRoot,runAsUser,escape_chains,automountServiceAccountToken,workload_identity_client_id"
+  elif [[ $ROSA_MODE -eq 1 ]]; then
+    echo "namespace,pod,scc,serviceAccount,privileged_container,status,scc_caps,defaultAddCapabilities,requiredDropCapabilities,requested_caps_from_pod,dropped_caps_from_pod,effective_caps,allowPrivilegeEscalation,hostPID,hostNetwork,hostIPC,runAsNonRoot,runAsUser,escape_chains,automountServiceAccountToken,irsa_iam_role_arn"
+  else
+    echo "namespace,pod,scc,serviceAccount,privileged_container,status,scc_caps,defaultAddCapabilities,requiredDropCapabilities,requested_caps_from_pod,dropped_caps_from_pod,effective_caps,allowPrivilegeEscalation,hostPID,hostNetwork,hostIPC,runAsNonRoot,runAsUser,escape_chains,automountServiceAccountToken"
+  fi
+fi
 
 JSON_ITEMS=()
 
@@ -148,23 +227,23 @@ scc_satisfies_pod() {
     local POD_NEEDS_HOSTIPC SCC_ALLOWS_HOSTIPC
 
     # Check privileged
-    POD_NEEDS_PRIV=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '[(.spec.initContainers[]?.securityContext.privileged // false), (.spec.containers[]?.securityContext.privileged // false)] | any(. == true)')
-    SCC_ALLOWS_PRIV=$(echo "$SCC_JSON" | ./jq-linux-amd64 -r '.allowPrivilegedContainer // false')
+    POD_NEEDS_PRIV=$(echo "$POD_JSON" | jq -r '[(.spec.initContainers[]?.securityContext.privileged // false), (.spec.containers[]?.securityContext.privileged // false)] | any(. == true)')
+    SCC_ALLOWS_PRIV=$(echo "$SCC_JSON" | jq -r '.allowPrivilegedContainer // false')
     [[ "$POD_NEEDS_PRIV" == "true" && "$SCC_ALLOWS_PRIV" != "true" ]] && return 1
 
     # Check hostNetwork
-    POD_NEEDS_HOSTNET=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.hostNetwork // false')
-    SCC_ALLOWS_HOSTNET=$(echo "$SCC_JSON" | ./jq-linux-amd64 -r '.allowHostNetwork // false')
+    POD_NEEDS_HOSTNET=$(echo "$POD_JSON" | jq -r '.spec.hostNetwork // false')
+    SCC_ALLOWS_HOSTNET=$(echo "$SCC_JSON" | jq -r '.allowHostNetwork // false')
     [[ "$POD_NEEDS_HOSTNET" == "true" && "$SCC_ALLOWS_HOSTNET" != "true" ]] && return 1
 
     # Check hostPID
-    POD_NEEDS_HOSTPID=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.hostPID // false')
-    SCC_ALLOWS_HOSTPID=$(echo "$SCC_JSON" | ./jq-linux-amd64 -r '.allowHostPID // false')
+    POD_NEEDS_HOSTPID=$(echo "$POD_JSON" | jq -r '.spec.hostPID // false')
+    SCC_ALLOWS_HOSTPID=$(echo "$SCC_JSON" | jq -r '.allowHostPID // false')
     [[ "$POD_NEEDS_HOSTPID" == "true" && "$SCC_ALLOWS_HOSTPID" != "true" ]] && return 1
 
     # Check hostIPC
-    POD_NEEDS_HOSTIPC=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.hostIPC // false')
-    SCC_ALLOWS_HOSTIPC=$(echo "$SCC_JSON" | ./jq-linux-amd64 -r '.allowHostIPC // false')
+    POD_NEEDS_HOSTIPC=$(echo "$POD_JSON" | jq -r '.spec.hostIPC // false')
+    SCC_ALLOWS_HOSTIPC=$(echo "$SCC_JSON" | jq -r '.allowHostIPC // false')
     [[ "$POD_NEEDS_HOSTIPC" == "true" && "$SCC_ALLOWS_HOSTIPC" != "true" ]] && return 1
 
     return 0
@@ -178,13 +257,13 @@ value_in_ranges() {
 
     while IFS= read -r range; do
         [[ -z "$range" ]] && continue
-        min=$(echo "$range" | ./jq-linux-amd64 -r '.min')
-        max=$(echo "$range" | ./jq-linux-amd64 -r '.max')
+        min=$(echo "$range" | jq -r '.min')
+        max=$(echo "$range" | jq -r '.max')
 
         if [[ $value -ge $min && $value -le $max ]]; then
             return 0
         fi
-    done < <(echo "$ranges_json" | ./jq-linux-amd64 -c '.[]')
+    done < <(echo "$ranges_json" | jq -c '.[]')
 
     return 1
 }
@@ -196,12 +275,12 @@ check_id_strategy() {
     local scc_name="$4"
 
     if [[ -z "$scc_strategy_json" || "$scc_strategy_json" == "null" ]]; then
-        echo "[DEBUG] $strategy_field strategy for SCC '$scc_name' is null/empty, assuming RunAsAny-like behavior."
+        [[ "$DEBUG" -eq 1 ]] && echo "[DEBUG] $strategy_field strategy for SCC '$scc_name' is null/empty, assuming RunAsAny-like behavior." >&2
         return 0
     fi
 
     local strategy_type
-    strategy_type=$(echo "$scc_strategy_json" | ./jq-linux-amd64 -r '.type // "RunAsAny"')
+    strategy_type=$(echo "$scc_strategy_json" | jq -r '.type // "RunAsAny"')
 
     case "$strategy_type" in
         "RunAsAny")
@@ -210,7 +289,7 @@ check_id_strategy() {
         "MustRunAsNonRoot")
             for val in "${pod_values[@]}"; do
                 if [[ "$val" == "0" || "$val" == 0 ]]; then
-                    echo "[DEBUG] $strategy_field strategy 'MustRunAsNonRoot' failed for SCC '$scc_name': pod requested UID/GID 0."
+                    [[ "$DEBUG" -eq 1 ]] && echo "[DEBUG] $strategy_field strategy 'MustRunAsNonRoot' failed for SCC '$scc_name': pod requested UID/GID 0." >&2
                     return 1
                 fi
             done
@@ -218,9 +297,9 @@ check_id_strategy() {
             ;;
         "MustRunAs")
             local strategy_uid strategy_gid strategy_ranges target_id
-            strategy_uid=$(echo "$scc_strategy_json" | ./jq-linux-amd64 -r '.uid // empty')
-            strategy_gid=$(echo "$scc_strategy_json" | ./jq-linux-amd64 -r '.gid // empty')
-            strategy_ranges=$(echo "$scc_strategy_json" | ./jq-linux-amd64 -c '.ranges // []')
+            strategy_uid=$(echo "$scc_strategy_json" | jq -r '.uid // empty')
+            strategy_gid=$(echo "$scc_strategy_json" | jq -r '.gid // empty')
+            strategy_ranges=$(echo "$scc_strategy_json" | jq -c '.ranges // []')
 
             target_id="$strategy_uid"
             if [[ -n "$strategy_gid" ]]; then target_id="$strategy_gid"; fi
@@ -231,7 +310,7 @@ check_id_strategy() {
                         return 0
                     fi
                 done
-                echo "[DEBUG] $strategy_field strategy 'MustRunAs' (ID: $target_id) failed for SCC '$scc_name': pod did not request the required ID."
+                [[ "$DEBUG" -eq 1 ]] && echo "[DEBUG] $strategy_field strategy 'MustRunAs' (ID: $target_id) failed for SCC '$scc_name': pod did not request the required ID." >&2
                 return 1
             elif [[ -n "$strategy_ranges" && "$strategy_ranges" != "[]" ]]; then
                 local found_in_range=0
@@ -244,37 +323,37 @@ check_id_strategy() {
                 if [[ $found_in_range -eq 1 ]]; then
                     return 0
                 else
-                    echo "[DEBUG] $strategy_field strategy 'MustRunAs' (ranges) failed for SCC '$scc_name': none of the pod's requested IDs matched the ranges."
+                    [[ "$DEBUG" -eq 1 ]] && echo "[DEBUG] $strategy_field strategy 'MustRunAs' (ranges) failed for SCC '$scc_name': none of the pod's requested IDs matched the ranges." >&2
                     return 1
                 fi
             else
-                echo "[DEBUG] $strategy_field strategy 'MustRunAs' for SCC '$scc_name' lacks uid/gid/ranges definition."
+                [[ "$DEBUG" -eq 1 ]] && echo "[DEBUG] $strategy_field strategy 'MustRunAs' for SCC '$scc_name' lacks uid/gid/ranges definition." >&2
                 return 1
             fi
             ;;
         "MustRunAsRange")
             local scc_ranges
-            scc_ranges=$(echo "$scc_strategy_json" | ./jq-linux-amd64 -c '.ranges // []')
+            scc_ranges=$(echo "$scc_strategy_json" | jq -c '.ranges // []')
             if [[ -z "$scc_ranges" || "$scc_ranges" == "[]" ]]; then
-                echo "[DEBUG] $strategy_field strategy 'MustRunAsRange' for SCC '$scc_name' has no defined ranges."
+                [[ "$DEBUG" -eq 1 ]] && echo "[DEBUG] $strategy_field strategy 'MustRunAsRange' for SCC '$scc_name' has no defined ranges." >&2
                 return 1
             fi
 
             for val in "${pod_values[@]}"; do
                 if [[ $val =~ ^[0-9]+$ ]]; then
                     if ! value_in_ranges "$val" "$scc_ranges"; then
-                        echo "[DEBUG] $strategy_field strategy 'MustRunAsRange' failed for SCC '$scc_name': value '$val' is outside defined ranges."
+                        [[ "$DEBUG" -eq 1 ]] && echo "[DEBUG] $strategy_field strategy 'MustRunAsRange' failed for SCC '$scc_name': value '$val' is outside defined ranges." >&2
                         return 1
                     fi
                 else
-                    echo "[DEBUG] $strategy_field strategy 'MustRunAsRange' failed for SCC '$scc_name': non-numeric value '$val' encountered."
+                    [[ "$DEBUG" -eq 1 ]] && echo "[DEBUG] $strategy_field strategy 'MustRunAsRange' failed for SCC '$scc_name': non-numeric value '$val' encountered." >&2
                     return 1
                 fi
             done
             return 0
             ;;
         *)
-            echo "[DEBUG] Unknown $strategy_field strategy type '$strategy_type' for SCC '$scc_name'."
+            [[ "$DEBUG" -eq 1 ]] && echo "[DEBUG] Unknown $strategy_field strategy type '$strategy_type' for SCC '$scc_name'." >&2
             return 1
             ;;
     esac
@@ -285,12 +364,12 @@ check_volumes_allowed() {
     local pod_spec_json="$2"
     local scc_name="$3"
 
-    if echo "$scc_volumes_json" | ./jq-linux-amd64 -e 'index("*")' > /dev/null; then
+    if echo "$scc_volumes_json" | jq -e 'index("*")' > /dev/null; then
         return 0
     fi
 
     local pod_volume_types
-    pod_volume_types=$(echo "$pod_spec_json" | ./jq-linux-amd64 -r '
+    pod_volume_types=$(echo "$pod_spec_json" | jq -r '
         .volumes // [] |
         .[] |
         to_entries |
@@ -301,9 +380,9 @@ check_volumes_allowed() {
 
     while IFS= read -r vol_type; do
         if [[ -n "$vol_type" ]]; then
-            if ! echo "$scc_volumes_json" | ./jq-linux-amd64 -e --arg vt "$vol_type" "map(ascii_downcase) | index(\$vt)" > /dev/null; then
-                if ! echo "$scc_volumes_json" | ./jq-linux-amd64 -e --arg vt "$vol_type" "index(\$vt)" > /dev/null; then
-                    echo "[DEBUG] Volume check for SCC '$scc_name': Volume type '$vol_type' is not allowed by SCC."
+            if ! echo "$scc_volumes_json" | jq -e --arg vt "$vol_type" "map(ascii_downcase) | index(\$vt)" > /dev/null; then
+                if ! echo "$scc_volumes_json" | jq -e --arg vt "$vol_type" "index(\$vt)" > /dev/null; then
+                    [[ "$DEBUG" -eq 1 ]] && echo "[DEBUG] Volume check for SCC '$scc_name': Volume type '$vol_type' is not allowed by SCC." >&2
                     return 1
                 fi
             fi
@@ -317,76 +396,76 @@ scc_satisfies_pod_enhanced() {
     local SCC_JSON="$1"
     local POD_JSON="$2"
     local SCC_NAME_DEBUG
-    SCC_NAME_DEBUG=$(echo "$SCC_JSON" | ./jq-linux-amd64 -r '.metadata.name // "unknown_scc"')
+    SCC_NAME_DEBUG=$(echo "$SCC_JSON" | jq -r '.metadata.name // "unknown_scc"')
 
     local POD_NEEDS_PRIV SCC_ALLOWS_PRIV
-    POD_NEEDS_PRIV=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '[(.spec.initContainers[]?.securityContext.privileged // false), (.spec.containers[]?.securityContext.privileged // false)] | any(. == true)')
-    SCC_ALLOWS_PRIV=$(echo "$SCC_JSON" | ./jq-linux-amd64 -r '.allowPrivilegedContainer // false')
+    POD_NEEDS_PRIV=$(echo "$POD_JSON" | jq -r '[(.spec.initContainers[]?.securityContext.privileged // false), (.spec.containers[]?.securityContext.privileged // false)] | any(. == true)')
+    SCC_ALLOWS_PRIV=$(echo "$SCC_JSON" | jq -r '.allowPrivilegedContainer // false')
     if [[ "$POD_NEEDS_PRIV" == "true" && "$SCC_ALLOWS_PRIV" != "true" ]]; then
-        echo "[DEBUG] SCC '$SCC_NAME_DEBUG' rejected: Pod needs privileged but SCC disallows it."
+        [[ "$DEBUG" -eq 1 ]] && echo "[DEBUG] SCC '$SCC_NAME_DEBUG' rejected: Pod needs privileged but SCC disallows it." >&2
         return 1
     fi
 
     local POD_NEEDS_HOSTNET SCC_ALLOWS_HOSTNET
-    POD_NEEDS_HOSTNET=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.hostNetwork // false')
-    SCC_ALLOWS_HOSTNET=$(echo "$SCC_JSON" | ./jq-linux-amd64 -r '.allowHostNetwork // false')
+    POD_NEEDS_HOSTNET=$(echo "$POD_JSON" | jq -r '.spec.hostNetwork // false')
+    SCC_ALLOWS_HOSTNET=$(echo "$SCC_JSON" | jq -r '.allowHostNetwork // false')
     if [[ "$POD_NEEDS_HOSTNET" == "true" && "$SCC_ALLOWS_HOSTNET" != "true" ]]; then
-        echo "[DEBUG] SCC '$SCC_NAME_DEBUG' rejected: Pod needs hostNetwork but SCC disallows it."
+        [[ "$DEBUG" -eq 1 ]] && echo "[DEBUG] SCC '$SCC_NAME_DEBUG' rejected: Pod needs hostNetwork but SCC disallows it." >&2
         return 1
     fi
 
     local POD_NEEDS_HOSTPID SCC_ALLOWS_HOSTPID
-    POD_NEEDS_HOSTPID=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.hostPID // false')
-    SCC_ALLOWS_HOSTPID=$(echo "$SCC_JSON" | ./jq-linux-amd64 -r '.allowHostPID // false')
+    POD_NEEDS_HOSTPID=$(echo "$POD_JSON" | jq -r '.spec.hostPID // false')
+    SCC_ALLOWS_HOSTPID=$(echo "$SCC_JSON" | jq -r '.allowHostPID // false')
     if [[ "$POD_NEEDS_HOSTPID" == "true" && "$SCC_ALLOWS_HOSTPID" != "true" ]]; then
-        echo "[DEBUG] SCC '$SCC_NAME_DEBUG' rejected: Pod needs hostPID but SCC disallows it."
+        [[ "$DEBUG" -eq 1 ]] && echo "[DEBUG] SCC '$SCC_NAME_DEBUG' rejected: Pod needs hostPID but SCC disallows it." >&2
         return 1
     fi
 
     local POD_NEEDS_HOSTIPC SCC_ALLOWS_HOSTIPC
-    POD_NEEDS_HOSTIPC=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.hostIPC // false')
-    SCC_ALLOWS_HOSTIPC=$(echo "$SCC_JSON" | ./jq-linux-amd64 -r '.allowHostIPC // false')
+    POD_NEEDS_HOSTIPC=$(echo "$POD_JSON" | jq -r '.spec.hostIPC // false')
+    SCC_ALLOWS_HOSTIPC=$(echo "$SCC_JSON" | jq -r '.allowHostIPC // false')
     if [[ "$POD_NEEDS_HOSTIPC" == "true" && "$SCC_ALLOWS_HOSTIPC" != "true" ]]; then
-        echo "[DEBUG] SCC '$SCC_NAME_DEBUG' rejected: Pod needs hostIPC but SCC disallows it."
+        [[ "$DEBUG" -eq 1 ]] && echo "[DEBUG] SCC '$SCC_NAME_DEBUG' rejected: Pod needs hostIPC but SCC disallows it." >&2
         return 1
     fi
 
     local scc_runasuser_strategy pod_runasuser_values pod_level_uid
-    scc_runasuser_strategy=$(echo "$SCC_JSON" | ./jq-linux-amd64 -c '.runAsUser // {}')
+    scc_runasuser_strategy=$(echo "$SCC_JSON" | jq -c '.runAsUser // {}')
     pod_runasuser_values=()
-    pod_level_uid=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.securityContext.runAsUser // empty')
+    pod_level_uid=$(echo "$POD_JSON" | jq -r '.spec.securityContext.runAsUser // empty')
     if [[ -n "$pod_level_uid" ]]; then pod_runasuser_values+=("$pod_level_uid"); fi
     while IFS= read -r uid; do
         if [[ -n "$uid" && "$uid" != "null" ]]; then pod_runasuser_values+=("$uid"); fi
-    done < <(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.containers[]?.securityContext.runAsUser // empty' 2>/dev/null)
+    done < <(echo "$POD_JSON" | jq -r '.spec.containers[]?.securityContext.runAsUser // empty' 2>/dev/null)
     while IFS= read -r uid; do
         if [[ -n "$uid" && "$uid" != "null" ]]; then pod_runasuser_values+=("$uid"); fi
-    done < <(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.initContainers[]?.securityContext.runAsUser // empty' 2>/dev/null)
+    done < <(echo "$POD_JSON" | jq -r '.spec.initContainers[]?.securityContext.runAsUser // empty' 2>/dev/null)
 
     if ! check_id_strategy "$scc_runasuser_strategy" pod_runasuser_values "runAsUser" "$SCC_NAME_DEBUG"; then
         return 1
     fi
 
     local scc_runasgroup_strategy pod_runasgroup_values pod_level_gid
-    scc_runasgroup_strategy=$(echo "$SCC_JSON" | ./jq-linux-amd64 -c '.runAsGroup // {}')
+    scc_runasgroup_strategy=$(echo "$SCC_JSON" | jq -c '.runAsGroup // {}')
     pod_runasgroup_values=()
-    pod_level_gid=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.securityContext.runAsGroup // empty')
+    pod_level_gid=$(echo "$POD_JSON" | jq -r '.spec.securityContext.runAsGroup // empty')
     if [[ -n "$pod_level_gid" ]]; then pod_runasgroup_values+=("$pod_level_gid"); fi
     while IFS= read -r gid; do
         if [[ -n "$gid" && "$gid" != "null" ]]; then pod_runasgroup_values+=("$gid"); fi
-    done < <(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.containers[]?.securityContext.runAsGroup // empty' 2>/dev/null)
+    done < <(echo "$POD_JSON" | jq -r '.spec.containers[]?.securityContext.runAsGroup // empty' 2>/dev/null)
     while IFS= read -r gid; do
         if [[ -n "$gid" && "$gid" != "null" ]]; then pod_runasgroup_values+=("$gid"); fi
-    done < <(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.initContainers[]?.securityContext.runAsGroup // empty' 2>/dev/null)
+    done < <(echo "$POD_JSON" | jq -r '.spec.initContainers[]?.securityContext.runAsGroup // empty' 2>/dev/null)
 
     if ! check_id_strategy "$scc_runasgroup_strategy" pod_runasgroup_values "runAsGroup" "$SCC_NAME_DEBUG"; then
         return 1
     fi
 
     local scc_fsgroup_strategy pod_fsgroup_values pod_level_fsgroup
-    scc_fsgroup_strategy=$(echo "$SCC_JSON" | ./jq-linux-amd64 -c '.fsGroup // {}')
+    scc_fsgroup_strategy=$(echo "$SCC_JSON" | jq -c '.fsGroup // {}')
     pod_fsgroup_values=()
-    pod_level_fsgroup=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.securityContext.fsGroup // empty')
+    pod_level_fsgroup=$(echo "$POD_JSON" | jq -r '.spec.securityContext.fsGroup // empty')
     if [[ -n "$pod_level_fsgroup" ]]; then pod_fsgroup_values+=("$pod_level_fsgroup"); fi
 
     if ! check_id_strategy "$scc_fsgroup_strategy" pod_fsgroup_values "fsGroup" "$SCC_NAME_DEBUG"; then
@@ -394,19 +473,19 @@ scc_satisfies_pod_enhanced() {
     fi
 
     local scc_supplemental_groups_strategy pod_supplemental_groups_values supplemental_groups_json
-    scc_supplemental_groups_strategy=$(echo "$SCC_JSON" | ./jq-linux-amd64 -c '.supplementalGroups // {}')
+    scc_supplemental_groups_strategy=$(echo "$SCC_JSON" | jq -c '.supplementalGroups // {}')
     pod_supplemental_groups_values=()
-    supplemental_groups_json=$(echo "$POD_JSON" | ./jq-linux-amd64 -c '.spec.securityContext.supplementalGroups // []')
+    supplemental_groups_json=$(echo "$POD_JSON" | jq -c '.spec.securityContext.supplementalGroups // []')
     while IFS= read -r gid; do
         if [[ -n "$gid" && "$gid" != "null" ]]; then pod_supplemental_groups_values+=("$gid"); fi
-    done < <(echo "$supplemental_groups_json" | ./jq-linux-amd64 -r '.[]')
+    done < <(echo "$supplemental_groups_json" | jq -r '.[]')
 
     if ! check_id_strategy "$scc_supplemental_groups_strategy" pod_supplemental_groups_values "supplementalGroups" "$SCC_NAME_DEBUG"; then
         return 1
     fi
 
     local scc_volumes_json
-    scc_volumes_json=$(echo "$SCC_JSON" | ./jq-linux-amd64 -c '.volumes // []')
+    scc_volumes_json=$(echo "$SCC_JSON" | jq -c '.volumes // []')
     if ! check_volumes_allowed "$scc_volumes_json" "$POD_JSON" "$SCC_NAME_DEBUG"; then
         return 1
     fi
@@ -417,23 +496,71 @@ scc_satisfies_pod_enhanced() {
 get_accessible_sccs() {
     local NS="$1"
     local SA_NAME="$2"
-    
-    echo "$ALL_SCCS_JSON" | ./jq-linux-amd64 -r --arg sa "system:serviceaccount:$NS:$SA_NAME" --arg ns "$NS" "
-        .items[] | select((.users[]? == \$sa) or (.groups[]? == \"system:authenticated\") or (.groups[]? == \"system:serviceaccounts\") or (.groups[]? == (\"system:serviceaccounts:\" + \$ns))) | .metadata.name"
+    local key="${NS}|${SA_NAME}"
+    if [[ -n "${ACCESSIBLE_SCC_CACHE[$key]+x}" ]]; then
+        echo "${ACCESSIBLE_SCC_CACHE[$key]}"
+        return
+    fi
+    local out
+    out=$(echo "$ALL_SCCS_JSON" | jq -r --arg sa "system:serviceaccount:$NS:$SA_NAME" --arg ns "$NS" "
+        .items[] | select((.users[]? == \$sa) or (.groups[]? == \"system:authenticated\") or (.groups[]? == \"system:serviceaccounts\") or (.groups[]? == (\"system:serviceaccounts:\" + \$ns))) | .metadata.name")
+    ACCESSIBLE_SCC_CACHE[$key]="$out"
+    echo "$out"
 }
 
 try_scc_subject_review() {
     local NS="$1"
     local POD_JSON="$2"
-    local TEMP_POD_FILE ACTUAL_SCC
+    local TEMP_POD_FILE ACTUAL_SCC SA_NAME SIG KEY
+
+    SA_NAME=$(echo "$POD_JSON" | jq -r '.spec.serviceAccountName // "default"')
+    # Include initContainers so cache keys don't collide across pods that only differ there
+    SIG=$(echo "$POD_JSON" | jq -c '{
+      sa: (.spec.serviceAccountName // "default"),
+      sc: (.spec.securityContext // {}),
+      hostNetwork: (.spec.hostNetwork // false),
+      hostPID: (.spec.hostPID // false),
+      hostIPC: (.spec.hostIPC // false),
+      vols: [(.spec.volumes // [])[] | {t: keys_unsorted[0], p: (.hostPath.path // null)}],
+      containers: [((.spec.containers // [])[] | {
+        privileged: (.securityContext.privileged // false),
+        ape: .securityContext.allowPrivilegeEscalation,
+        runAsUser: .securityContext.runAsUser,
+        runAsGroup: .securityContext.runAsGroup,
+        caps: (.securityContext.capabilities // {})
+      })],
+      initContainers: [((.spec.initContainers // [])[] | {
+        privileged: (.securityContext.privileged // false),
+        ape: .securityContext.allowPrivilegeEscalation,
+        runAsUser: .securityContext.runAsUser,
+        runAsGroup: .securityContext.runAsGroup,
+        caps: (.securityContext.capabilities // {})
+      })],
+      ephemeralContainers: [((.spec.ephemeralContainers // [])[] | {
+        privileged: (.securityContext.privileged // false),
+        ape: .securityContext.allowPrivilegeEscalation,
+        runAsUser: .securityContext.runAsUser,
+        runAsGroup: .securityContext.runAsGroup,
+        caps: (.securityContext.capabilities // {})
+      })]
+    }')
+    KEY="${NS}|${SA_NAME}|${SIG}"
+    if [[ -n "${SCC_REVIEW_CACHE[$KEY]+x}" ]]; then
+        ACTUAL_SCC="${SCC_REVIEW_CACHE[$KEY]}"
+        echo "$ACTUAL_SCC" && return 0
+    fi
 
     TEMP_POD_FILE=$(mktemp)
-    echo "$POD_JSON" | ./jq-linux-amd64 '{apiVersion: "v1", kind: "Pod", metadata: {name: (.metadata.name // "test"), namespace: "'"$NS"'"}, spec: .spec}' > "$TEMP_POD_FILE" 2>/dev/null
+    echo "$POD_JSON" | jq '{apiVersion: "v1", kind: "Pod", metadata: {name: (.metadata.name // "test"), namespace: "'"$NS"'"}, spec: .spec}' > "$TEMP_POD_FILE" 2>/dev/null
 
-    ACTUAL_SCC=$(oc adm policy scc-subject-review -f "$TEMP_POD_FILE" -n "$NS" -o json 2>/dev/null | ./jq-linux-amd64 -r '.status.allowedBy.name // empty')
+    ACTUAL_SCC=$(oc adm policy scc-subject-review -f "$TEMP_POD_FILE" -n "$NS" -o json 2>/dev/null | jq -r '.status.allowedBy.name // empty')
     rm -f "$TEMP_POD_FILE"
-    
-    [[ -n "$ACTUAL_SCC" ]] && echo "$ACTUAL_SCC" && return 0
+    # Cache positive hits only — empty/failure must not stick across transient API errors
+    if [[ -n "$ACTUAL_SCC" ]]; then
+      SCC_REVIEW_CACHE[$KEY]="$ACTUAL_SCC"
+      echo "$ACTUAL_SCC"
+      return 0
+    fi
     return 1
 }
 
@@ -452,12 +579,12 @@ try_enhanced_matching() {
     while IFS= read -r scc_name; do
         [[ -z "$scc_name" ]] && continue
         local SCC_JSON
-        SCC_JSON=$(echo "$ALL_SCCS_JSON" | ./jq-linux-amd64 --arg name "$scc_name" ".items[] | select(.metadata.name == \$name)")
+        SCC_JSON="${SCC_BY_NAME[$scc_name]:-}"
         [[ -z "$SCC_JSON" ]] && continue
 
         if scc_satisfies_pod "$SCC_JSON" "$POD_JSON"; then
             local PRIORITY
-            PRIORITY=$(echo "$SCC_JSON" | ./jq-linux-amd64 -r '.priority // 0')
+            PRIORITY=$(echo "$SCC_JSON" | jq -r '.priority // 0')
             if [[ $PRIORITY -gt $BEST_PRIORITY ]]; then
                 BEST_PRIORITY=$PRIORITY
                 BEST_SCC="$scc_name"
@@ -484,12 +611,12 @@ try_enhanced_matching_v2() {
     while IFS= read -r scc_name; do
         [[ -z "$scc_name" ]] && continue
         local SCC_JSON
-        SCC_JSON=$(echo "$ALL_SCCS_JSON" | ./jq-linux-amd64 --arg name "$scc_name" ".items[] | select(.metadata.name == \$name)")
+        SCC_JSON="${SCC_BY_NAME[$scc_name]:-}"
         [[ -z "$SCC_JSON" ]] && continue
 
         if scc_satisfies_pod_enhanced "$SCC_JSON" "$POD_JSON"; then
             local PRIORITY
-            PRIORITY=$(echo "$SCC_JSON" | ./jq-linux-amd64 -r '.priority // 0')
+            PRIORITY=$(echo "$SCC_JSON" | jq -r '.priority // 0')
             if [[ $PRIORITY -gt $BEST_PRIORITY ]]; then
                 BEST_PRIORITY=$PRIORITY
                 BEST_SCC="$scc_name"
@@ -507,41 +634,69 @@ try_enhanced_matching_v2() {
 # =============================================================================================
 
 # -----------------------------
-# Iterate namespaces
+# Iterate namespaces (from prefetched NS_JSON)
 # -----------------------------
-NS_LIST=$(oc get namespaces -o json | ./jq-linux-amd64 -r '.items[].metadata.name')
+NS_LIST=$(echo "$NS_JSON" | jq -r '.items[].metadata.name')
 
 while read -r NS; do
     [ -z "$NS" ] && continue
 
     IS_SYSTEM_NS=0
     # Reserved kube names only — not kube-* prefix (lab fixtures may use kube-rbac-polp-*).
-    if [[ "$NS" == openshift-* ]] \
-        || [[ "$NS" == "kube-system" || "$NS" == "kube-public" || "$NS" == "kube-node-lease" ]]; then
+    # CRC / KubeVirt hostpath CSI namespaces are platform storage (privileged hostPath expected).
+    if [[ "$NS" == "openshift" || "$NS" == openshift-* ]] \
+        || [[ "$NS" == "kube-system" || "$NS" == "kube-public" || "$NS" == "kube-node-lease" ]] \
+        || [[ "$NS" == "hostpath-provisioner" || "$NS" == "kubevirt-hostpath-provisioner" ]]; then
         IS_SYSTEM_NS=1
     fi
     [[ "$ONLY_USER_NS" -eq 1 && "$IS_SYSTEM_NS" -eq 1 ]] && continue
 
-    # -----------------------------
-    # Get pod list and trim empty lines
-    POD_LIST_RAW=$(oc get pods -n "$NS" -o json | ./jq-linux-amd64 -r '.items[].metadata.name')
-    # remove empty lines and lines containing only whitespace
-    POD_LIST=$(echo "$POD_LIST_RAW" | sed '/^\s*$/d')
-
-    if [[ -z "$POD_LIST" ]]; then
+    # One list call per namespace; reuse full pod objects (no per-pod get)
+    if ! PODS_JSON=$(oc get pods -n "$NS" -o json 2>/dev/null); then
+            info "        --- Namespace: $NS ---"
+            info "        [WARN] Failed to list pods in namespace: $NS"
+            info ""
+            continue
+    fi
+    POD_COUNT=$(echo "$PODS_JSON" | jq -r '.items | length')
+    if [[ "$POD_COUNT" -eq 0 ]]; then
             [[ "$OUTPUT_MODE" == "text" ]] && echo "        --- Namespace: $NS ---" && echo "        [INFO] No pods found in namespace: $NS" && echo ""
             continue
     fi
 
-    # Separator for each namespace output
-    echo "---------------------------------------------------------"
-    echo "--- Namespace: $NS ---"
-    echo "---------------------------------------------------------"
-    echo ""
+    # Separator for each namespace output (text only — keep CSV/JSON clean)
+    if [[ "$OUTPUT_MODE" == "text" ]]; then
+      echo "---------------------------------------------------------"
+      echo "--- Namespace: $NS ---"
+      echo "---------------------------------------------------------"
+      echo ""
+    fi
 
-    while read -r POD; do
+    while IFS= read -r POD_JSON; do
+        [ -z "$POD_JSON" ] && continue
+        POD=$(echo "$POD_JSON" | jq -r '.metadata.name')
         [ -z "$POD" ] && continue
-            POD_JSON=$(oc get pod "$POD" -n "$NS" -o json)
+        SA_NAME=$(echo "$POD_JSON" | jq -r '.spec.serviceAccountName // "default"')
+        CLOUD_ID="none"
+        if [[ $ARO_MODE -eq 1 ]]; then
+          CLOUD_ID=$(echo "$POD_JSON" | jq -r '.metadata.annotations["azure.workload.identity/client-id"] // empty')
+          if [[ -z "$CLOUD_ID" ]]; then
+            _sa_json=$(oc get serviceaccount "$SA_NAME" -n "$NS" -o json 2>/dev/null || true)
+            if [[ -n "$_sa_json" ]]; then
+              CLOUD_ID=$(echo "$_sa_json" | jq -r '.metadata.annotations["azure.workload.identity/client-id"] // .metadata.annotations["azure.workload.identity/service-account-client-id"] // empty')
+            fi
+          fi
+          [[ -z "$CLOUD_ID" ]] && CLOUD_ID="none"
+        elif [[ $ROSA_MODE -eq 1 ]]; then
+          CLOUD_ID=$(echo "$POD_JSON" | jq -r '.metadata.annotations["eks.amazonaws.com/role-arn"] // .metadata.annotations["iam.amazonaws.com/role"] // empty')
+          if [[ -z "$CLOUD_ID" ]]; then
+            _sa_json=$(oc get serviceaccount "$SA_NAME" -n "$NS" -o json 2>/dev/null || true)
+            if [[ -n "$_sa_json" ]]; then
+              CLOUD_ID=$(echo "$_sa_json" | jq -r '.metadata.annotations["eks.amazonaws.com/role-arn"] // .metadata.annotations["iam.amazonaws.com/role"] // empty')
+            fi
+          fi
+          [[ -z "$CLOUD_ID" ]] && CLOUD_ID="none"
+        fi
 
         # Privileged container check
         # -----------------------------
@@ -552,7 +707,7 @@ while read -r NS; do
 		
 		
         # Debugging the individual checks for privileged containers
-        INIT_CONTAINER_PRIVILEGED=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '{
+        INIT_CONTAINER_PRIVILEGED=$(echo "$POD_JSON" | jq -r '{
             initContainers: (
                 .spec.initContainers // []  # If initContainers is null, treat it as an empty array
             ) | [
@@ -564,7 +719,7 @@ while read -r NS; do
         }')
 
 
-        CONTAINER_PRIVILEGED=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '{
+        CONTAINER_PRIVILEGED=$(echo "$POD_JSON" | jq -r '{
             containers: (
                 .spec.containers // []  # If containers is null, treat it as an empty array
             ) | [
@@ -581,14 +736,13 @@ while read -r NS; do
         [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: initContainers privileged values = $INIT_CONTAINER_PRIVILEGED"
         [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: containers privileged values = $CONTAINER_PRIVILEGED"
 
-		# Calculate PRIV_CHECK by combining the individual results
-		PRIV_CHECK=$(echo "[$INIT_CONTAINER_PRIVILEGED, $CONTAINER_PRIVILEGED]" | ./jq-linux-amd64 -r '
-			# Combining both initContainers and containers privileged info into one array
-			[.[] | .initContainers[]?.privileged // false, .containers[]?.privileged // false] 
-			| flatten 
-			| any(. == true) 
-			| tostring 
-			| ascii_downcase')
+		# Calculate PRIV_CHECK (init + containers + ephemeral; API default privileged=false)
+		PRIV_CHECK=$(echo "$POD_JSON" | jq -r '
+			[
+				((.spec.initContainers // [])[] | .securityContext.privileged // false),
+				((.spec.containers // [])[] | .securityContext.privileged // false),
+				((.spec.ephemeralContainers // [])[] | .securityContext.privileged // false)
+			] | any | tostring | ascii_downcase')
 
         # Show how PRIV_CHECK is calculated
         [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: PRIV_CHECK result from jq = $PRIV_CHECK"
@@ -617,7 +771,7 @@ while read -r NS; do
         [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: Evaluating AllowPrivilegeEscalation for initContainers and containers"
         
         # Debugging the individual checks for allowPrivilegeEscalation
-        INIT_CONTAINER_ALLOW_PRIVILEGE_ESCALATION=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '{
+        INIT_CONTAINER_ALLOW_PRIVILEGE_ESCALATION=$(echo "$POD_JSON" | jq -r '{
             initContainers: (
                 .spec.initContainers // []  # If initContainers is null, treat it as an empty array
             ) | [
@@ -628,7 +782,7 @@ while read -r NS; do
             ]
         }')
 
-        CONTAINER_ALLOW_PRIVILEGE_ESCALATION=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '{
+        CONTAINER_ALLOW_PRIVILEGE_ESCALATION=$(echo "$POD_JSON" | jq -r '{
             containers: (
                 .spec.containers // []  # If containers is null, treat it as an empty array
             ) | [
@@ -643,14 +797,13 @@ while read -r NS; do
         [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: initContainers allowPrivilegeEscalation values = $INIT_CONTAINER_ALLOW_PRIVILEGE_ESCALATION"
         [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: containers allowPrivilegeEscalation values = $CONTAINER_ALLOW_PRIVILEGE_ESCALATION"
 
-        # Calculate ALLOW_PRIVILEGE_ESCALATION_CHECK by combining the individual results
-        ALLOW_PRIVILEGE_ESCALATION_CHECK=$(echo "[$INIT_CONTAINER_ALLOW_PRIVILEGE_ESCALATION, $CONTAINER_ALLOW_PRIVILEGE_ESCALATION]" | ./jq-linux-amd64 -r '
-            # Combining both initContainers and containers allowPrivilegeEscalation info into one array
-            [.[] | .initContainers[]?.allowPrivilegeEscalation // false, .containers[]?.allowPrivilegeEscalation // false] 
-            | flatten 
-            | any(. == true) 
-            | tostring 
-            | ascii_downcase')
+        # API default allowPrivilegeEscalation=true when unset; include ephemeralContainers
+        ALLOW_PRIVILEGE_ESCALATION_CHECK=$(echo "$POD_JSON" | jq -r '
+            [
+              ((.spec.initContainers // [])[] | ((.securityContext // {}) | .allowPrivilegeEscalation) != false),
+              ((.spec.containers // [])[] | ((.securityContext // {}) | .allowPrivilegeEscalation) != false),
+              ((.spec.ephemeralContainers // [])[] | ((.securityContext // {}) | .allowPrivilegeEscalation) != false)
+            ] | any | tostring | ascii_downcase')
 
         # Show how ALLOW_PRIVILEGE_ESCALATION_CHECK is calculated
         [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: ALLOW_PRIVILEGE_ESCALATION_CHECK result from jq = $ALLOW_PRIVILEGE_ESCALATION_CHECK"
@@ -678,14 +831,14 @@ while read -r NS; do
         SCC_UNRESOLVED=0
 
         # STEP 1: Check authoritative annotation
-        SCC_NAME=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '.metadata.annotations["openshift.io/scc"] // empty')
+        SCC_NAME=$(echo "$POD_JSON" | jq -r '.metadata.annotations["openshift.io/scc"] // empty')
 
         if [[ -n "$SCC_NAME" ]]; then
             [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: ✓ Found authoritative SCC annotation: $SCC_NAME"
         else
             # STEP 2: Apply enhanced guessing
             [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: ✗ No SCC annotation, attempting to determine SCC..."
-            SA_NAME=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.serviceAccountName // "default"')
+            SA_NAME=$(echo "$POD_JSON" | jq -r '.spec.serviceAccountName // "default"')
             SCC_WAS_GUESSED=1
             SCC_GUESS_FROM_ENHANCED_V2=0
 
@@ -711,7 +864,7 @@ while read -r NS; do
         if [[ "$SCC_UNRESOLVED" -eq 1 ]]; then
             SCC_JSON=""
         else
-            SCC_JSON=$(echo "$ALL_SCCS_JSON" | ./jq-linux-amd64 --arg name "$SCC_NAME" ".items[] | select(.metadata.name == \$name)")
+            SCC_JSON="${SCC_BY_NAME[$SCC_NAME]:-}"
         fi
 
         # Validate guess and prepare display name (same bar as matcher when v2 picked the SCC)
@@ -745,7 +898,7 @@ while read -r NS; do
             SCC_CAPS_DISPLAY="N/A (SCC unknown)"
             SCC_CAPS_ARRAY=()
         else
-            SCC_CAPS=$(echo "$SCC_JSON" | ./jq-linux-amd64 -r '.allowedCapabilities // [] | .[]? | ascii_upcase' | grep -v '^$')
+            SCC_CAPS=$(echo "$SCC_JSON" | jq -r '.allowedCapabilities // [] | .[]? | ascii_upcase' | grep -v '^$')
             if [[ "$SCC_CAPS" == "*" ]]; then
                     SCC_CAPS_ARRAY=("${ALL_LINUX_CAPS[@]}")
                     [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: SCC Allowed Caps is '*', using ALL_LINUX_CAPS"
@@ -767,7 +920,7 @@ while read -r NS; do
             SCC_DEFAULT_ADD_DISPLAY="N/A (SCC unknown)"
             SCC_DEFAULT_ADD_ARRAY=()
         else
-            SCC_DEFAULT_ADD=$(echo "$SCC_JSON" | ./jq-linux-amd64 -r '.defaultAddCapabilities // [] | .[] | ascii_upcase' | grep -v '^$')
+            SCC_DEFAULT_ADD=$(echo "$SCC_JSON" | jq -r '.defaultAddCapabilities // [] | .[] | ascii_upcase' | grep -v '^$')
             if [[ -z "$SCC_DEFAULT_ADD" || "$SCC_DEFAULT_ADD" == "null" ]]; then
                     SCC_DEFAULT_ADD_DISPLAY="None"
                     SCC_DEFAULT_ADD_ARRAY=()
@@ -787,7 +940,7 @@ while read -r NS; do
             SCC_REQUIRED_DROP_DISPLAY="N/A (SCC unknown)"
             SCC_REQUIRED_DROP_ARRAY=()
         else
-            SCC_REQUIRED_DROP=$(echo "$SCC_JSON" | ./jq-linux-amd64 -r '.requiredDropCapabilities // [] | .[] | ascii_upcase' | grep -v '^$')
+            SCC_REQUIRED_DROP=$(echo "$SCC_JSON" | jq -r '.requiredDropCapabilities // [] | .[] | ascii_upcase' | grep -v '^$')
             if [[ -z "$SCC_REQUIRED_DROP" || "$SCC_REQUIRED_DROP" == "null" ]]; then
                     SCC_REQUIRED_DROP_DISPLAY="None"
                     SCC_REQUIRED_DROP_ARRAY=()
@@ -803,7 +956,7 @@ while read -r NS; do
         # -----------------------------
         # Requested caps
         # -----------------------------
-        REQUESTED_CAPS=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '
+        REQUESTED_CAPS=$(echo "$POD_JSON" | jq -r '
           [(.spec.initContainers[]?.securityContext.capabilities.add // []),
            (.spec.containers[]?.securityContext.capabilities.add // [])] 
           | flatten | unique | .[]? | ascii_upcase' | grep -v '^$')
@@ -819,7 +972,7 @@ while read -r NS; do
         # -----------------------------
         # Dropped caps from pod
         # -----------------------------
-        DROPPED_CAPS=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '
+        DROPPED_CAPS=$(echo "$POD_JSON" | jq -r '
           [(.spec.initContainers[]?.securityContext.capabilities.drop // []),
            (.spec.containers[]?.securityContext.capabilities.drop // [])] 
           | flatten | unique | .[]? | ascii_upcase' | grep -v '^$')
@@ -833,26 +986,26 @@ while read -r NS; do
 
         # Pod & container securityContext fields
         # -----------------------------
-        HOST_PID_CHECK=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '
+        HOST_PID_CHECK=$(echo "$POD_JSON" | jq -r '
             [.spec.initContainers[]?.securityContext.hostPID,
              .spec.containers[]?.securityContext.hostPID,
              .spec.hostPID // false] | any(. == true) | tostring | ascii_downcase')
         [[ "$HOST_PID_CHECK" == "true" ]] && HOST_PID_DISPLAY="true (at least one container has HostPID set to True)" || HOST_PID_DISPLAY="false"
         [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: HOST_PID_DISPLAY = $HOST_PID_DISPLAY"
 
-        HOST_NETWORK_CHECK=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.hostNetwork // false | tostring | ascii_downcase')
+        HOST_NETWORK_CHECK=$(echo "$POD_JSON" | jq -r '.spec.hostNetwork // false | tostring | ascii_downcase')
         [[ "$HOST_NETWORK_CHECK" == "true" ]] && HOST_NETWORK_DISPLAY="true" || HOST_NETWORK_DISPLAY="false"
         [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: HOST_NETWORK_DISPLAY = $HOST_NETWORK_DISPLAY"
 
-        HOST_IPC_CHECK=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '
+        HOST_IPC_CHECK=$(echo "$POD_JSON" | jq -r '
             [.spec.initContainers[]?.securityContext.hostIPC,
              .spec.containers[]?.securityContext.hostIPC,
              .spec.hostIPC // false] | any(. == true) | tostring | ascii_downcase')
         [[ "$HOST_IPC_CHECK" == "true" ]] && HOST_IPC_DISPLAY="true (at least one container has HostIPC set to True)" || HOST_IPC_DISPLAY="false"
         [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: HOST_IPC_DISPLAY = $HOST_IPC_DISPLAY"
 
-        SHARE_PROC_NS=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.shareProcessNamespace // false | tostring | ascii_downcase')
-        mapfile -t HOSTPATH_WRITABLE_PATHS < <(echo "$POD_JSON" | ./jq-linux-amd64 -r '
+        SHARE_PROC_NS=$(echo "$POD_JSON" | jq -r '.spec.shareProcessNamespace // false | tostring | ascii_downcase')
+        mapfile -t HOSTPATH_WRITABLE_PATHS < <(echo "$POD_JSON" | jq -r '
             ((.spec.volumes // []) | map(select(.hostPath != null) | {name, path: .hostPath.path})) as $hp |
             [
               (.spec.initContainers // [])[],
@@ -870,9 +1023,9 @@ while read -r NS; do
         ' || true)
 
         # runAsNonRoot
-        POD_RUNASNONROOT=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.securityContext.runAsNonRoot // empty')
+        POD_RUNASNONROOT=$(echo "$POD_JSON" | jq -r '.spec.securityContext.runAsNonRoot // empty')
         [[ "$POD_RUNASNONROOT" == "" ]] && POD_RUNASNONROOT="unset"
-        mapfile -t CONTAINER_RUNASNONROOT_VALUES < <(echo "$POD_JSON" | ./jq-linux-amd64 -r '
+        mapfile -t CONTAINER_RUNASNONROOT_VALUES < <(echo "$POD_JSON" | jq -r '
             [.spec.initContainers[]?.securityContext.runAsNonRoot,
              .spec.containers[]?.securityContext.runAsNonRoot] | map(select(. != null)) | .[]?')
 
@@ -894,9 +1047,9 @@ while read -r NS; do
         [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: RUN_AS_NONROOT_DISPLAY = $RUN_AS_NONROOT_DISPLAY"
 
         # runAsUser
-        POD_RUNASUSER=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.securityContext.runAsUser // empty')
+        POD_RUNASUSER=$(echo "$POD_JSON" | jq -r '.spec.securityContext.runAsUser // empty')
         [[ "$POD_RUNASUSER" == "" ]] && POD_RUNASUSER="unset"
-        mapfile -t CONTAINER_RUNASUSER_VALUES < <(echo "$POD_JSON" | ./jq-linux-amd64 -r '
+        mapfile -t CONTAINER_RUNASUSER_VALUES < <(echo "$POD_JSON" | jq -r '
             [.spec.initContainers[]?.securityContext.runAsUser,
              .spec.containers[]?.securityContext.runAsUser] | map(select(. != null)) | .[]?')
 
@@ -920,7 +1073,7 @@ while read -r NS; do
         # --- automountServiceAccountToken + SA privileged caps check (optimized, full debug) ---
 
                 AUTOMOUNT_WARNING=0
-                RAW_POD_AUTOMOUNT=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.automountServiceAccountToken')
+                RAW_POD_AUTOMOUNT=$(echo "$POD_JSON" | jq -r '.spec.automountServiceAccountToken')
         if [[ "$RAW_POD_AUTOMOUNT" == "false" ]]; then
                 POD_AUTOMOUNT_LOGIC=0
                 POD_AUTOMOUNT_REASON="pod-level false"
@@ -934,7 +1087,7 @@ while read -r NS; do
         fi
 
         mapfile -t CONTAINER_AUTOMOUNT_VALUES < <(
-                echo "$POD_JSON" | ./jq-linux-amd64 -r '
+                echo "$POD_JSON" | jq -r '
                   [.spec.initContainers[]?.automountServiceAccountToken,
                    .spec.containers[]?.automountServiceAccountToken]
                   | .[]?
@@ -942,7 +1095,7 @@ while read -r NS; do
         )
 
         mapfile -t CONTAINER_NAMES < <(
-                echo "$POD_JSON" | ./jq-linux-amd64 -r '
+                echo "$POD_JSON" | jq -r '
                   [.spec.initContainers[]?.name,
                    .spec.containers[]?.name]
                   | .[]?
@@ -977,17 +1130,22 @@ while read -r NS; do
         fi
 
         # --- ServiceAccount and privileged SCCs (skipped when SCC unknown — SCC-derived) ---
-        SA_NAME=$(echo "$POD_JSON" | ./jq-linux-amd64 -r '.spec.serviceAccountName // "default"')
+        SA_NAME=$(echo "$POD_JSON" | jq -r '.spec.serviceAccountName // "default"')
 
+        unset SCC_PRIV_CAPS
         declare -A SCC_PRIV_CAPS
         if [[ "$SCC_UNRESOLVED" -eq 0 ]]; then
                 mapfile -t SA_PRIV_SCCS < <(
-                        echo "$ALL_SCCS_JSON" | ./jq-linux-amd64 -r --arg sa "system:serviceaccount:$NS:$SA_NAME" "
+                        echo "$ALL_SCCS_JSON" | jq -r --arg sa "system:serviceaccount:$NS:$SA_NAME" --arg ns "$NS" '
                             .items[]
-                            | select(.users[]? == \$sa)
-                            | \"\\(.metadata.name):\\((.allowedCapabilities // []) | join(\",\"))\""
+                            | select(
+                                (.users[]? == $sa)
+                                or (.groups[]? == "system:authenticated")
+                                or (.groups[]? == "system:serviceaccounts")
+                                or (.groups[]? == ("system:serviceaccounts:" + $ns))
+                              )
+                            | "\(.metadata.name):\((.allowedCapabilities // []) | join(","))"'
                 )
-
                 for scc_entry in "${SA_PRIV_SCCS[@]}"; do
                         scc_name="${scc_entry%%:*}"
                         caps="${scc_entry#*:}"
@@ -1070,7 +1228,12 @@ while read -r NS; do
                         [[ $skip -eq 0 ]] && TMP_EFFECTIVE+=("$cap")
                         [[ "$DEBUG" -eq 1 && $skip -eq 1 ]] && echo "        Step 4 - Dropped specific cap: $cap"
                 done
-                mapfile -t EFFECTIVE_CAPS < <(printf "%s\n" "${TMP_EFFECTIVE[@]}" | awk '!seen[$0]++')
+                # Empty array + printf "%s\n" emits a blank line; guard so DROP ALL stays truly empty.
+                if [[ ${#TMP_EFFECTIVE[@]} -eq 0 ]]; then
+                        EFFECTIVE_CAPS=()
+                else
+                        mapfile -t EFFECTIVE_CAPS < <(printf "%s\n" "${TMP_EFFECTIVE[@]}" | awk 'NF && !seen[$0]++')
+                fi
                 [[ "$DEBUG" -eq 1 ]] && echo "        Step 5 - Effective caps after dedup (pod-only): ${EFFECTIVE_CAPS[*]}"
         else
                 [[ "$DEBUG" -eq 1 ]] && echo "DEBUG: Privileged container not detected, using normal effective caps logic"
@@ -1112,7 +1275,11 @@ while read -r NS; do
                         [[ "$DEBUG" -eq 1 && $skip -eq 1 ]] && echo "        Step 4 - Dropped specific cap: $cap"
                 done
 
-                mapfile -t EFFECTIVE_CAPS < <(printf "%s\n" "${TMP_EFFECTIVE[@]}" | awk '!seen[$0]++')
+                if [[ ${#TMP_EFFECTIVE[@]} -eq 0 ]]; then
+                        EFFECTIVE_CAPS=()
+                else
+                        mapfile -t EFFECTIVE_CAPS < <(printf "%s\n" "${TMP_EFFECTIVE[@]}" | awk 'NF && !seen[$0]++')
+                fi
                 [[ "$DEBUG" -eq 1 ]] && echo "        Step 5 - Effective caps after dedup: ${EFFECTIVE_CAPS[*]}"
         fi
 
@@ -1124,10 +1291,12 @@ while read -r NS; do
         if [[ $DROP_ALL -eq 1 && ${#EFFECTIVE_CAPS[@]} -eq 0 ]]; then
                 # No capabilities left after DROP ALL, so return a message
                 EFFECTIVE_CAPS_STR="DROP ALL applied - No capabilities remaining"
+                EFFECTIVE_CAPS_TAGGED=()
         else
                 # Otherwise, prepare for tagging and final output string
                 EFFECTIVE_CAPS_TAGGED=()
                 for cap in "${EFFECTIVE_CAPS[@]}"; do
+                        [[ -z "$cap" ]] && continue
                         if containsElement "$cap" "${BASELINE_CAPS[@]}"; then
                                 EFFECTIVE_CAPS_TAGGED+=("$cap (baseline)")
                         elif containsElement "$cap" "${BASELINE_PRIVILEGED_CAPS[@]}"; then
@@ -1140,7 +1309,11 @@ while read -r NS; do
                 done
 
                 # Final string after tagging
-                EFFECTIVE_CAPS_STR="${EFFECTIVE_CAPS_TAGGED[*]}"
+                if [[ $DROP_ALL -eq 1 && ${#EFFECTIVE_CAPS_TAGGED[@]} -eq 0 ]]; then
+                        EFFECTIVE_CAPS_STR="DROP ALL applied - No capabilities remaining"
+                else
+                        EFFECTIVE_CAPS_STR="${EFFECTIVE_CAPS_TAGGED[*]}"
+                fi
         fi
 
         ESCAPE_CHAIN_MSGS=()
@@ -1234,7 +1407,13 @@ while read -r NS; do
                 done
                 [[ $ONLY_BASELINE_CAPS -eq 1 && ${#EFFECTIVE_CAPS[@]} -gt 0 ]] && ALERTS_INFO_OK+=("OK: only baseline capabilities in user namespace")
 
-                [[ ${#EFFECTIVE_CAPS[@]} -eq 0 ]] && ALERTS_INFO_OK+=("INFO: no capabilities detected")
+                if [[ ${#EFFECTIVE_CAPS[@]} -eq 0 ]]; then
+                    if [[ $DROP_ALL -eq 1 ]]; then
+                        ALERTS_INFO_OK+=("OK: DROP ALL - no capabilities remaining")
+                    else
+                        ALERTS_INFO_OK+=("INFO: no capabilities detected")
+                    fi
+                fi
             fi
 
         # --- System namespace alerts ---
@@ -1295,7 +1474,7 @@ while read -r NS; do
             ESCAPE_CHAINS_JSON='[]'
         else
             ESCAPE_CHAINS_CSV=$(printf '%s; ' "${ESCAPE_CHAIN_MSGS[@]}" | sed 's/; $//')
-            ESCAPE_CHAINS_JSON=$(printf '%s\n' "${ESCAPE_CHAIN_MSGS[@]}" | ./jq-linux-amd64 -R . | ./jq-linux-amd64 -s .)
+            ESCAPE_CHAINS_JSON=$(printf '%s\n' "${ESCAPE_CHAIN_MSGS[@]}" | jq -R . | jq -s .)
         fi
 
         # -----------------------------
@@ -1304,6 +1483,11 @@ while read -r NS; do
                 echo "        --- Pod: $POD ---"
                 echo "        SCC: $DISPLAY_SCC"
 				echo "        Service Account: $SA_NAME"
+                if [[ $ARO_MODE -eq 1 ]]; then
+                  echo "        workloadIdentityClientId: $CLOUD_ID"
+                elif [[ $ROSA_MODE -eq 1 ]]; then
+                  echo "        irsaIamRoleArn: $CLOUD_ID"
+                fi
                 echo "        Privileged Container: $PRIV_CONTAINER_DISPLAY"
                 echo "        Allow Privilege Escalation: $ALLOW_PRIV_ESC_DISPLAY"
                 echo "        hostPID: $HOST_PID_DISPLAY"
@@ -1358,12 +1542,22 @@ while read -r NS; do
                 else
                         AUTOMOUNT_DISPLAY_ESCAPED="false ($AUTOMOUNT_REASON)"
                 fi
+                AUTOMOUNT_DISPLAY_ESCAPED=${AUTOMOUNT_DISPLAY_ESCAPED//\"/\"\"}
 
-                echo "\"$NS_ESCAPED\",\"$POD_ESCAPED\",\"$SCC_NAME_ESCAPED\",\"$SA_NAME_ESCAPED\",\"$PRIV_TEXT_ESCAPED\",\"$STATUS_ESCAPED\",\"$SCC_CAPS_DISPLAY_ESCAPED\",\"$SCC_DEFAULT_ADD_DISPLAY_ESCAPED\",\"$SCC_REQUIRED_DROP_DISPLAY_ESCAPED\",\"$REQUESTED_CAPS_STR_ESCAPED\",\"$DROPPED_CAPS_STR_ESCAPED\",\"$EFFECTIVE_CAPS_STR_ESCAPED\",\"$ALLOW_PRIV_ESC_DISPLAY_ESCAPED\",\"$HOST_PID_DISPLAY_ESCAPED\",\"$HOST_NETWORK_DISPLAY_ESCAPED\",\"$HOST_IPC_DISPLAY_ESCAPED\",\"$RUN_AS_NONROOT_DISPLAY_ESCAPED\",\"$RUN_AS_USER_DISPLAY_ESCAPED\",\"$ESCAPE_CHAINS_ESCAPED\",\"$AUTOMOUNT_DISPLAY_ESCAPED\""
+                CLOUD_ID_ESCAPED=${CLOUD_ID//\"/\"\"} 
+                if [[ $ARO_MODE -eq 1 || $ROSA_MODE -eq 1 ]]; then
+                  echo "\"$NS_ESCAPED\",\"$POD_ESCAPED\",\"$SCC_NAME_ESCAPED\",\"$SA_NAME_ESCAPED\",\"$PRIV_TEXT_ESCAPED\",\"$STATUS_ESCAPED\",\"$SCC_CAPS_DISPLAY_ESCAPED\",\"$SCC_DEFAULT_ADD_DISPLAY_ESCAPED\",\"$SCC_REQUIRED_DROP_DISPLAY_ESCAPED\",\"$REQUESTED_CAPS_STR_ESCAPED\",\"$DROPPED_CAPS_STR_ESCAPED\",\"$EFFECTIVE_CAPS_STR_ESCAPED\",\"$ALLOW_PRIV_ESC_DISPLAY_ESCAPED\",\"$HOST_PID_DISPLAY_ESCAPED\",\"$HOST_NETWORK_DISPLAY_ESCAPED\",\"$HOST_IPC_DISPLAY_ESCAPED\",\"$RUN_AS_NONROOT_DISPLAY_ESCAPED\",\"$RUN_AS_USER_DISPLAY_ESCAPED\",\"$ESCAPE_CHAINS_ESCAPED\",\"$AUTOMOUNT_DISPLAY_ESCAPED\",\"$CLOUD_ID_ESCAPED\""
+                else
+                  echo "\"$NS_ESCAPED\",\"$POD_ESCAPED\",\"$SCC_NAME_ESCAPED\",\"$SA_NAME_ESCAPED\",\"$PRIV_TEXT_ESCAPED\",\"$STATUS_ESCAPED\",\"$SCC_CAPS_DISPLAY_ESCAPED\",\"$SCC_DEFAULT_ADD_DISPLAY_ESCAPED\",\"$SCC_REQUIRED_DROP_DISPLAY_ESCAPED\",\"$REQUESTED_CAPS_STR_ESCAPED\",\"$DROPPED_CAPS_STR_ESCAPED\",\"$EFFECTIVE_CAPS_STR_ESCAPED\",\"$ALLOW_PRIV_ESC_DISPLAY_ESCAPED\",\"$HOST_PID_DISPLAY_ESCAPED\",\"$HOST_NETWORK_DISPLAY_ESCAPED\",\"$HOST_IPC_DISPLAY_ESCAPED\",\"$RUN_AS_NONROOT_DISPLAY_ESCAPED\",\"$RUN_AS_USER_DISPLAY_ESCAPED\",\"$ESCAPE_CHAINS_ESCAPED\",\"$AUTOMOUNT_DISPLAY_ESCAPED\""
+                fi
 
         elif [[ "$OUTPUT_MODE" == "json" ]]; then
                 PRIV_TEXT_JSON=$PRIV_CONTAINER_DISPLAY
-                EFFECTIVE_JSON=$(printf '%s\n' "${EFFECTIVE_CAPS_TAGGED[@]}" | ./jq-linux-amd64 -R . | ./jq-linux-amd64 -s .)
+                if [[ ${#EFFECTIVE_CAPS_TAGGED[@]} -eq 0 ]]; then
+                  EFFECTIVE_JSON='[]'
+                else
+                  EFFECTIVE_JSON=$(printf '%s\n' "${EFFECTIVE_CAPS_TAGGED[@]}" | jq -R . | jq -s .)
+                fi
 
                 # dynamic automount for JSON
                 if [[ $AUTOMOUNT_TRUE -eq 1 ]]; then
@@ -1374,7 +1568,7 @@ while read -r NS; do
                         AUTOMOUNT_REASON_JSON="$AUTOMOUNT_REASON"
                 fi
 
-                JSON_ITEM=$(./jq-linux-amd64 -c -n \
+                JSON_ITEM=$(jq -c -n \
                         --arg ns "$NS" \
                         --arg pod "$POD" \
                         --arg scc "$SCC_NAME" \
@@ -1419,14 +1613,39 @@ while read -r NS; do
                                 automountServiceAccountToken: \$automount,
                                 automount_reason: \$automount_reason
                         }")
+                if [[ $ARO_MODE -eq 1 ]]; then
+                  JSON_ITEM=$(echo "$JSON_ITEM" | jq -c --arg c "$CLOUD_ID" '. + {workload_identity_client_id: $c}')
+                elif [[ $ROSA_MODE -eq 1 ]]; then
+                  JSON_ITEM=$(echo "$JSON_ITEM" | jq -c --arg c "$CLOUD_ID" '. + {irsa_iam_role_arn: $c}')
+                fi
                 JSON_ITEMS+=("$JSON_ITEM")
         fi
 
-    done <<< "$POD_LIST"
+    done < <(echo "$PODS_JSON" | jq -c '.items[]')
 
 done <<< "$NS_LIST"
 
 # Output JSON array if requested
 if [[ "$OUTPUT_MODE" == "json" ]]; then
-    printf '%s\n' "${JSON_ITEMS[@]}" | ./jq-linux-amd64 -s .
+    printf '%s\n' "${JSON_ITEMS[@]}" | jq -s .
+fi
+
+
+
+# Duration footer (stderr for csv/json so machine output stays parseable)
+END_TIME_NS=$(date +%s%N)
+DURATION_NS=$((END_TIME_NS - START_TIME_NS))
+DURATION_MS=$((DURATION_NS / 1000000))
+MS=$((DURATION_MS % 1000))
+SEC=$(( (DURATION_MS / 1000) % 60 ))
+MIN=$(( (DURATION_MS / 60000) % 60 ))
+HOUR=$(( DURATION_MS / 3600000 ))
+if [[ "$OUTPUT_MODE" == "text" ]]; then
+  printf "===== Caps/SCC Audit Complete =====\n"
+  printf "Execution time: %02d:%02d:%02d.%03d (HH:MM:SS.mmm)\n" \
+         "$HOUR" "$MIN" "$SEC" "$MS"
+else
+  printf "===== Caps/SCC Audit Complete =====\n" >&2
+  printf "Execution time: %02d:%02d:%02d.%03d (HH:MM:SS.mmm)\n" \
+         "$HOUR" "$MIN" "$SEC" "$MS" >&2
 fi
