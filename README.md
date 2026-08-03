@@ -4,7 +4,7 @@ Shell scripts that audit **Kubernetes RBAC** and **workload security** (PSA labe
 
 **Use for labs and learning only** — not a replacement for cloud IAM reviews, admission controllers, or org policy.
 
-**Testing status:** Heavily used on **local Kubernetes** and **OpenShift** (older tree). **AKS**, **GKE**, and **EKS** scripts and their Terraform lab stacks have been validated end-to-end (apply → audits → destroy).
+**Testing status:** Validated end-to-end on **local Kubernetes** (Vanilla), **AKS**, **GKE**, **EKS**, and **OpenShift CRC** (scripts + Terraform lab fixtures where applicable). **Not yet tested** on managed OpenShift **ARO** or **ROSA** (optional Check 20 / cloud flags only).
 
 ---
 
