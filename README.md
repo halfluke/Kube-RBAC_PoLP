@@ -6,6 +6,15 @@ Shell scripts that audit **Kubernetes RBAC** and **workload security** (PSA labe
 
 **Testing status:** Validated end-to-end on **local Kubernetes** (Vanilla), **AKS**, **GKE**, **EKS**, and **OpenShift CRC** (scripts + Terraform lab fixtures where applicable). **Not yet tested** on managed OpenShift **ARO** or **ROSA** (optional Check 20 / cloud flags only).
 
+**OpenShift-related names:**
+
+| Acronym | Meaning |
+|---------|---------|
+| **CRC** | **CodeReady Containers** (also branded **OpenShift Local**) — single-node OpenShift for a laptop/desktop lab. |
+| **OKD** | **Origin Kubernetes Distribution** — community/open-source OpenShift upstream; some CRC bundles can run OKD instead of Red Hat OpenShift. |
+| **ARO** | **Azure Red Hat OpenShift** — managed OpenShift on Azure. |
+| **ROSA** | **Red Hat OpenShift Service on AWS** — managed OpenShift on AWS. |
+
 ---
 
 ## Start here: pick your situation
